@@ -2,28 +2,27 @@
 # ------------------------------------------------------------
 # Streamlit dashboard for options:
 # - ITM/ATM/OTM tables, greeks, BSM/IV, last collection only
-# - DI curve is NOT shown by vertices anymore (removed yield_curve table display)
-# - Strategy picker (Top 3) with payoff chart shown ONLY when user selects an operation
+# - Strategy picker (Top N) with payoff chart shown ONLY when user selects an operation
 #
-# NEW in this version:
-# - Uses technical indicators from daily_bars to infer "trend/regime"
-#   (SMA20/50/200, MACD_hist, RSI14, ATR14)
-# - Strategy filters adapt to the inferred regime and show criteria used on-screen
-# - Clear "criteria box" explaining what was used for each strategy
+# Features:
+# 1) Expiry selection OPTIONAL: "(Todos)" aggregates across expiries.
+# 2) Asset selection OPTIONAL: "(Todos)" aggregates across ALL active tickers.
+#    - For each asset, we use its own latest trade_date (MAX in option_quote).
+#    - We load daily_bars (close/indicators) for that same trade_date (if available).
+#    - We compute regime PER asset and keep it in the dataset.
+# 3) Top N.
+# 4) Travas: debit and credit grouped together with tabs (comparability).
+# 5) Liquidity criteria by leg + by pair (spreads/straddle):
+#    - Single-leg: gates + class OK/ALERTA/RUIM, optional hard filter, penalty in score.
+#    - Pair: min_liq + symmetry ratio, class OK/ALERTA/RUIM, hard filter + penalty.
 #
-# Includes:
-# - Payoff with break-even(s)
-# - Payoff in % of spot toggle
-# - "per 100 shares" toggle
-# - Strategies (Top 3):
-#   1) Long deep ITM call
-#   2) Short put (sell puts)
-#   3) Vertical spreads (bull call / bear put)
-#   4) Covered call
-#   5) Long straddle
-#   6) Short condor with CALLs and PUTs (pure condor, not iron)
+# Universe filter (recommended):
+# - abs(ln(strike/spot)) <= mny_log_max
+# - abs(delta) >= delta_abs_min
+# - last_price >= last_price_min
+# - volume_fin >= vol_fin_min
 #
-# DB tables assumed (adjust SQL if your schema differs):
+# DB tables assumed:
 # - assets(id, ticker, is_active)
 # - daily_bars(asset_id, trade_date, close, vol_annual,
 #             sma_20, sma_50, sma_200,
@@ -34,10 +33,6 @@
 # - option_model(asset_id, trade_date, option_symbol, spot, rate_r, dividend_q, t_years,
 #               iv, bsm_price, bsm_price_histvol, mispricing, mispricing_pct,
 #               delta, gamma, vega, theta, rho, hist_vol_annual, collected_at)
-#
-# Streamlit note:
-# - uses st.dataframe(..., on_select="rerun", selection_mode="single-row")
-#   If your Streamlit version doesn't support it, it falls back to selectbox.
 # ------------------------------------------------------------
 
 import os
@@ -64,6 +59,8 @@ DB_NAME = os.getenv("DB_NAME", "finance_options")
 if not DB_PASS:
     st.error("DB_PASSWORD/DB_PASS não definido no .env")
     st.stop()
+
+TOP_N = 5
 
 # =========================
 # DB helpers (cache)
@@ -95,9 +92,6 @@ def load_latest_trade_date(asset_id: int):
 
 @st.cache_data(ttl=60)
 def load_daily_indicators(asset_id: int, trade_date: date):
-    """
-    Pull indicators from daily_bars for the selected trade_date.
-    """
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -185,11 +179,6 @@ def _to_float(x):
         return None
 
 def infer_regime(ind: dict, rsi_hi: float = 55, rsi_lo: float = 45):
-    """
-    Returns:
-      regime: "Alta" | "Baixa" | "Neutra" | "N/A"
-      score_up, score_down, details(dict)
-    """
     if not ind:
         return "N/A", 0, 0, {}
 
@@ -205,7 +194,6 @@ def infer_regime(ind: dict, rsi_hi: float = 55, rsi_lo: float = 45):
     down = 0
     details = {}
 
-    # SMA stack
     if (sma20 is not None) and (sma50 is not None) and (sma200 is not None):
         if sma20 > sma50 > sma200:
             up += 2
@@ -218,7 +206,6 @@ def infer_regime(ind: dict, rsi_hi: float = 55, rsi_lo: float = 45):
     else:
         details["SMA_stack"] = "N/A"
 
-    # close vs SMA50
     if (close is not None) and (sma50 is not None):
         if close > sma50:
             up += 1
@@ -231,7 +218,6 @@ def infer_regime(ind: dict, rsi_hi: float = 55, rsi_lo: float = 45):
     else:
         details["Close_vs_SMA50"] = "N/A"
 
-    # MACD hist
     if macdh is not None:
         if macdh > 0:
             up += 1
@@ -244,7 +230,6 @@ def infer_regime(ind: dict, rsi_hi: float = 55, rsi_lo: float = 45):
     else:
         details["MACD_hist"] = "N/A"
 
-    # RSI regime
     if rsi is not None:
         if rsi >= rsi_hi:
             up += 1
@@ -257,7 +242,6 @@ def infer_regime(ind: dict, rsi_hi: float = 55, rsi_lo: float = 45):
     else:
         details["RSI"] = "N/A"
 
-    # ATR (não vota para cima/baixo; só informa volatilidade/risco)
     details["ATR14"] = atr
 
     if up >= down + 2:
@@ -266,38 +250,99 @@ def infer_regime(ind: dict, rsi_hi: float = 55, rsi_lo: float = 45):
         return "Baixa", up, down, details
     return "Neutra", up, down, details
 
+@st.cache_data(ttl=60)
+def load_all_active_data(assets_df: pd.DataFrame):
+    all_rows = []
+    meta_rows = []
+
+    for _, a in assets_df.iterrows():
+        asset_id = int(a["id"])
+        ticker = str(a["ticker"])
+
+        td = load_latest_trade_date(asset_id)
+        if not td:
+            continue
+
+        ind = load_daily_indicators(asset_id, td) or {}
+        regime, up_score, down_score, reg_details = infer_regime(ind, rsi_hi=55, rsi_lo=45)
+
+        close = _to_float(ind.get("close"))
+        vol_annual = _to_float(ind.get("vol_annual"))
+
+        df = load_chain(asset_id, td)
+        if df is None or df.empty:
+            continue
+
+        if close is None or not np.isfinite(close) or close <= 0:
+            s2 = pd.to_numeric(df.get("spot", np.nan), errors="coerce").dropna()
+            close = float(s2.iloc[0]) if len(s2) else None
+
+        df = df.copy()
+        df["asset_id"] = asset_id
+        df["ticker"] = ticker
+        df["trade_date"] = td
+        df["spot_ref"] = close
+        df["hist_vol_annual_ref"] = vol_annual
+        df["regime"] = regime
+        df["regime_up_score"] = up_score
+        df["regime_down_score"] = down_score
+
+        all_rows.append(df)
+
+        meta_rows.append({
+            "asset_id": asset_id,
+            "ticker": ticker,
+            "trade_date": td,
+            "spot_ref": close,
+            "hist_vol_annual_ref": vol_annual,
+            "regime": regime,
+            "up_score": up_score,
+            "down_score": down_score,
+            "SMA_stack": reg_details.get("SMA_stack"),
+            "Close_vs_SMA50": reg_details.get("Close_vs_SMA50"),
+            "MACD_hist": reg_details.get("MACD_hist"),
+            "RSI": reg_details.get("RSI"),
+        })
+
+    df_all = pd.concat(all_rows, ignore_index=True) if all_rows else pd.DataFrame()
+    meta_df = pd.DataFrame(meta_rows)
+    return df_all, meta_df
+
 # =========================
 # Moneyness + formatting
 # =========================
 
-def classify_moneyness(df: pd.DataFrame, spot: float, atm_mode: str, atm_pct: float):
+def classify_moneyness_multi(df: pd.DataFrame, atm_mode: str, atm_pct: float):
     d = df.copy()
-    d["strike"] = pd.to_numeric(d["strike"], errors="coerce")
-    if spot is None or not np.isfinite(spot) or spot <= 0:
-        d["moneyness"] = "UNKNOWN"
-        d["moneyness_dist"] = np.nan
-        return d
+    d["strike"] = pd.to_numeric(d.get("strike", np.nan), errors="coerce")
+    d["spot_ref"] = pd.to_numeric(d.get("spot_ref", np.nan), errors="coerce")
 
-    d["moneyness_dist"] = (d["strike"] - spot).abs() / spot
+    ok = d["strike"].notna() & d["spot_ref"].notna() & (d["spot_ref"] > 0)
+    d.loc[~ok, "moneyness"] = "UNKNOWN"
+    d.loc[~ok, "moneyness_dist"] = np.nan
 
-    def base_itm_otm(row):
+    d.loc[ok, "moneyness_dist"] = (d.loc[ok, "strike"] - d.loc[ok, "spot_ref"]).abs() / d.loc[ok, "spot_ref"]
+
+    def _base(row):
         t = str(row["option_type"]).upper()
         K = float(row["strike"])
+        S = float(row["spot_ref"])
         if t == "CALL":
-            return "ITM" if K < spot else "OTM"
-        return "ITM" if K > spot else "OTM"
+            return "ITM" if K < S else "OTM"
+        return "ITM" if K > S else "OTM"
 
-    d["m_base"] = d.apply(base_itm_otm, axis=1)
+    d["m_base"] = "UNKNOWN"
+    d.loc[ok, "m_base"] = d.loc[ok].apply(_base, axis=1)
 
     if atm_mode == "pct":
-        d["moneyness"] = np.where(d["moneyness_dist"] <= atm_pct, "ATM", d["m_base"])
+        d.loc[ok, "moneyness"] = np.where(d.loc[ok, "moneyness_dist"] <= atm_pct, "ATM", d.loc[ok, "m_base"])
         return d.drop(columns=["m_base"])
 
-    d["moneyness"] = d["m_base"]
-    idx = (
-        d.groupby(["expiry_date", "option_type"])["moneyness_dist"]
-        .idxmin().dropna().astype(int).tolist()
-    )
+    d.loc[ok, "moneyness"] = d.loc[ok, "m_base"]
+
+    gcols = ["asset_id", "expiry_date", "option_type"]
+    tmp = d.loc[ok].copy()
+    idx = tmp.groupby(gcols)["moneyness_dist"].idxmin().dropna().astype(int).tolist()
     d.loc[idx, "moneyness"] = "ATM"
     return d.drop(columns=["m_base"])
 
@@ -306,10 +351,17 @@ def format_table(df: pd.DataFrame):
         return pd.DataFrame()
 
     out = df.copy()
+
+    # Ensure no duplicate column names (pyarrow fails)
+    out = out.loc[:, ~out.columns.duplicated()].copy()
+
     num_cols = [
         "strike","last_price","trades","volume","moneyness_dist",
         "iv","bsm_price","bsm_price_histvol","mispricing","mispricing_pct",
-        "delta","gamma","vega","theta","rho","rate_r"
+        "delta","gamma","vega","theta","rho","rate_r","spot_ref",
+        "liq","liq_buy","liq_sell","liq_call","liq_put",
+        "liq_min","liq_ratio","premium_total","debit","credit","rr","cr","rr_adj","cr_adj",
+        "mny_log_abs","volume_fin"
     ]
     for c in num_cols:
         if c in out.columns:
@@ -324,24 +376,28 @@ def format_table(df: pd.DataFrame):
         out["iv_pct"] = out["iv"] * 100.0
 
     cols = [
+        "ticker","trade_date",
         "option_symbol","option_type","expiry_date",
+        "spot_ref",
         "strike","last_price","trades","volume",
         "moneyness","moneyness_dist",
+        "mny_log_abs","volume_fin",
+        "liq","liq_class",
         "rate_r","iv","iv_pct",
         "bsm_price","bsm_price_histvol",
         "mispricing","mispricing_pct",
         "delta","gamma","vega","vega_1pct",
         "theta","theta_day_365","theta_day_252","rho",
-        "quote_collected_at","model_collected_at"
+        "quote_collected_at","model_collected_at",
+        "regime"
     ]
     cols = [c for c in cols if c in out.columns]
     out = out[cols].copy()
 
-    # arredondamento
-    for c in ["strike","last_price"]:
+    for c in ["spot_ref","strike","last_price","volume_fin"]:
         if c in out.columns:
-            out[c] = out[c].round(2)
-    for c in ["moneyness_dist","rate_r"]:
+            out[c] = out[c].round(4 if c == "spot_ref" else 2)
+    for c in ["moneyness_dist","rate_r","liq","liq_buy","liq_sell","liq_call","liq_put","liq_min","liq_ratio","mny_log_abs"]:
         if c in out.columns:
             out[c] = out[c].round(6 if c == "rate_r" else 4)
     for c in ["iv","iv_pct","bsm_price","bsm_price_histvol","mispricing","mispricing_pct","delta","gamma","vega","vega_1pct","theta","theta_day_365","theta_day_252","rho"]:
@@ -351,37 +407,55 @@ def format_table(df: pd.DataFrame):
     return out
 
 # =========================
-# Payoff logic (P&L at expiry)
+# Universe filter (moneyness/delta/ultimo/volume_fin)
 # =========================
 
-def payoff_long_call(ST, K, premium):
-    return np.maximum(ST - K, 0.0) - premium
+def apply_universe_filter(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+    d = df.copy()
 
-def payoff_short_call(ST, K, premium):
-    return premium - np.maximum(ST - K, 0.0)
+    S = pd.to_numeric(d.get("spot_ref", np.nan), errors="coerce")
+    K = pd.to_numeric(d.get("strike", np.nan), errors="coerce")
+    delta = pd.to_numeric(d.get("delta", np.nan), errors="coerce")
+    lastp = pd.to_numeric(d.get("last_price", np.nan), errors="coerce")
+    vol = pd.to_numeric(d.get("volume", 0), errors="coerce").fillna(0)
 
-def payoff_long_put(ST, K, premium):
-    return np.maximum(K - ST, 0.0) - premium
+    ok = S.notna() & K.notna() & (S > 0) & (K > 0)
+    log_mny = pd.Series(np.nan, index=d.index, dtype="float64")
+    log_mny.loc[ok] = np.abs(np.log(K.loc[ok] / S.loc[ok]))
 
-def payoff_short_put(ST, K, premium):
-    return premium - np.maximum(K - ST, 0.0)
+    # Proxy de volume financeiro diário (R$):
+    # last_price (R$ por ação) * volume (contratos) * multiplicador (100 ações/contrato na B3)
+    vol_fin = lastp.fillna(0) * vol * float(cfg["opt_contract_mult"])
 
-def payoff_stock(ST, S0):
-    return ST - S0
+    d["mny_log_abs"] = log_mny
+    d["volume_fin"] = vol_fin
+
+    mask = (
+        ok
+        & (d["mny_log_abs"] <= float(cfg["mny_log_max"]))
+        & (delta.abs() >= float(cfg["delta_abs_min"]))
+        & (lastp >= float(cfg["last_price_min"]))
+        & (d["volume_fin"] >= float(cfg["vol_fin_min"]))
+    )
+
+    return d[mask].copy()
+
+# =========================
+# Payoff
+# =========================
+
+def payoff_long_call(ST, K, premium):  return np.maximum(ST - K, 0.0) - premium
+def payoff_short_call(ST, K, premium): return premium - np.maximum(ST - K, 0.0)
+def payoff_long_put(ST, K, premium):   return np.maximum(K - ST, 0.0) - premium
+def payoff_short_put(ST, K, premium):  return premium - np.maximum(K - ST, 0.0)
+def payoff_stock(ST, S0):              return ST - S0
 
 def payoff_strategy(op: dict, ST: np.ndarray, spot: float) -> np.ndarray:
-    """
-    op: dict:
-      - legs: list of {type:'CALL'|'PUT', side:'LONG'|'SHORT', K, premium}
-      - include_stock: bool
-      - stock_qty: float
-    """
     legs = op.get("legs", [])
     include_stock = bool(op.get("include_stock", False))
     stock_qty = float(op.get("stock_qty", 1.0))
 
     total = np.zeros_like(ST, dtype=float)
-
     if include_stock:
         total += stock_qty * payoff_stock(ST, spot)
 
@@ -403,9 +477,6 @@ def payoff_strategy(op: dict, ST: np.ndarray, spot: float) -> np.ndarray:
     return total
 
 def find_break_evens(ST: np.ndarray, pnl: np.ndarray, tol: float = 1e-8):
-    """
-    Find approximate break-even points (pnl==0) by sign changes + linear interpolation.
-    """
     be = []
     y = pnl
     x = ST
@@ -435,7 +506,7 @@ def plot_payoff(op: dict, spot: float, multiplier: float, show_pct: bool):
 
     lo = max(0.01, 0.5 * s0)
     hi = 1.5 * s0
-    ST = np.linspace(lo, hi, 700)
+    ST = np.linspace(lo, hi, 800)
 
     pnl = payoff_strategy(op, ST, s0) * float(multiplier)
 
@@ -475,472 +546,10 @@ def plot_payoff(op: dict, spot: float, multiplier: float, show_pct: bool):
     )
 
 # =========================
-# Strategy selectors (Top3) + regime-aware criteria
-# =========================
-
-def _liquidity_score(df):
-    t = pd.to_numeric(df["trades"], errors="coerce").fillna(0)
-    v = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
-    return t + np.log1p(v)
-
-def top_itm_buy_calls(df, expiry, regime: str, cfg: dict) -> pd.DataFrame:
-    """
-    Long deep ITM call:
-    - In Alta: allow delta >= 0.75 (prefer 0.80+), prefer lower IV (cheaper), good liquidity
-    - In Baixa: still allowed but stricter (delta >= 0.85) and prefer lower IV + higher mispricing_pct negative (cheap)
-    - In Neutra: base delta >= 0.80
-    """
-    d = df[(df["option_type"]=="CALL") & (df["expiry_date"]==expiry)].copy()
-    d["delta"] = pd.to_numeric(d["delta"], errors="coerce")
-    d["iv"] = pd.to_numeric(d["iv"], errors="coerce")
-    d["last_price"] = pd.to_numeric(d["last_price"], errors="coerce")
-    d["mispricing_pct"] = pd.to_numeric(d.get("mispricing_pct", np.nan), errors="coerce")
-
-    if regime == "Alta":
-        dmin = cfg["deep_itm_delta_up"]
-    elif regime == "Baixa":
-        dmin = cfg["deep_itm_delta_down"]
-    else:
-        dmin = cfg["deep_itm_delta_neutral"]
-
-    d = d[(d["moneyness"]=="ITM") & (d["delta"]>=dmin) & (d["iv"].notna()) & (d["last_price"]>0)].copy()
-    if d.empty:
-        return d
-
-    d["liq"] = _liquidity_score(d)
-    # prefer: liquidity high, IV low; if bearish, also prefer mispricing_pct more negative (cheaper vs BSM)
-    if regime == "Baixa":
-        d["cheapness"] = d["mispricing_pct"].fillna(0)  # negative is "cheap"
-        return d.sort_values(["liq","cheapness","iv"], ascending=[False, True, True]).head(3)
-
-    return d.sort_values(["liq","iv"], ascending=[False, True]).head(3)
-
-def top_sell_puts(df, expiry, regime: str, cfg: dict) -> pd.DataFrame:
-    """
-    Short put:
-    - Prefer in Alta/Neutra; in Baixa, either skip or require far OTM and smaller |delta|
-    - Base: PUT OTM/ATM with delta in [put_delta_lo, put_delta_hi] (negative deltas)
-    """
-    d = df[(df["option_type"]=="PUT") & (df["expiry_date"]==expiry)].copy()
-    d["delta"] = pd.to_numeric(d["delta"], errors="coerce")
-    d["iv"] = pd.to_numeric(d["iv"], errors="coerce")
-    d["last_price"] = pd.to_numeric(d["last_price"], errors="coerce")
-    d["moneyness_dist"] = pd.to_numeric(d["moneyness_dist"], errors="coerce")
-
-    lo, hi = cfg["put_delta_lo"], cfg["put_delta_hi"]  # negative values, e.g. -0.35..-0.10
-
-    # If bearish, reduce risk: closer to -0.10 and farther OTM
-    if regime == "Baixa":
-        lo = cfg["put_delta_lo_bear"]     # e.g. -0.25
-        hi = cfg["put_delta_hi_bear"]     # e.g. -0.08
-        min_dist = cfg["put_min_otm_dist_bear"]  # e.g. 0.015
-    else:
-        min_dist = 0.0
-
-    d = d[(d["moneyness"].isin(["OTM","ATM"])) & (d["delta"].between(lo, hi)) & (d["iv"].notna()) & (d["last_price"]>0)].copy()
-    if min_dist > 0:
-        d = d[(d["moneyness"]=="OTM") & (d["moneyness_dist"]>=min_dist)].copy()
-
-    if d.empty:
-        return d
-
-    d["liq"] = _liquidity_score(d)
-    # prefer: higher IV and higher premium (but still liquid)
-    d["score"] = (d["iv"].fillna(0)*100.0) + (d["last_price"].fillna(0)*5.0) + d["liq"].fillna(0)
-    return d.sort_values(["score"], ascending=[False]).head(3)
-
-def top_covered_calls(df, expiry, regime: str, cfg: dict) -> pd.DataFrame:
-    """
-    Covered call (sell call):
-    - In Alta: prefer OTM (avoid capping too much), delta 0.15..0.25
-    - In Neutra: OTM/ATM, delta 0.20..0.30
-    - In Baixa: can sell closer ATM (higher premium), delta 0.25..0.40 (but higher assignment risk)
-    """
-    d = df[(df["option_type"]=="CALL") & (df["expiry_date"]==expiry)].copy()
-    d["delta"] = pd.to_numeric(d["delta"], errors="coerce")
-    d["iv"] = pd.to_numeric(d["iv"], errors="coerce")
-    d["last_price"] = pd.to_numeric(d["last_price"], errors="coerce")
-
-    if regime == "Alta":
-        mset = ["OTM"]
-        dlo, dhi = cfg["cc_delta_up"]
-    elif regime == "Baixa":
-        mset = ["OTM","ATM"]
-        dlo, dhi = cfg["cc_delta_down"]
-    else:
-        mset = ["OTM","ATM"]
-        dlo, dhi = cfg["cc_delta_neutral"]
-
-    d = d[(d["moneyness"].isin(mset)) & (d["delta"].between(dlo, dhi)) & (d["iv"].notna()) & (d["last_price"]>0)].copy()
-    if d.empty:
-        return d
-
-    d["liq"] = _liquidity_score(d)
-    # prefer: higher premium and good liquidity (covered call is income)
-    d["score"] = (d["last_price"].fillna(0)*10.0) + d["liq"].fillna(0)
-    return d.sort_values(["score"], ascending=[False]).head(3)
-
-def top_vertical_spreads(df, expiry, kind="bull_call", regime: str = "Neutra", cfg: dict = None) -> pd.DataFrame:
-    """
-    Vertical spreads (debit) – regime-aware preference:
-    - If regime == Alta: show Bull Call first, filters are more permissive.
-    - If regime == Baixa: show Bear Put first, filters are more permissive.
-    - If regime == Neutra: both.
-    """
-    if cfg is None:
-        cfg = {}
-
-    d = df[df["expiry_date"]==expiry].copy()
-    d["strike"] = pd.to_numeric(d["strike"], errors="coerce")
-    d["last_price"] = pd.to_numeric(d["last_price"], errors="coerce")
-    d = d.dropna(subset=["strike","last_price"]).copy()
-    d = d[d["last_price"] > 0].copy()
-
-    rows = []
-    if kind == "bull_call":
-        calls = d[d["option_type"]=="CALL"].copy()
-        buy = calls[calls["moneyness"]=="ATM"].copy()
-        sell = calls[calls["moneyness"]=="OTM"].copy()
-
-        # In Alta, allow ATM buy; in Baixa, keep stricter to avoid fighting trend
-        if regime == "Baixa":
-            # demand MACD/RSI etc handled outside; here just reduce candidates by delta if available
-            buy["delta"] = pd.to_numeric(buy.get("delta", np.nan), errors="coerce")
-            buy = buy[(buy["delta"].isna()) | (buy["delta"] >= 0.45)].copy()
-
-        for _, b in buy.iterrows():
-            cand = sell[sell["strike"] > b["strike"]].sort_values("strike").head(12)
-            for _, s in cand.iterrows():
-                debit = float(b["last_price"]) - float(s["last_price"])
-                if debit <= 0:
-                    continue
-                max_profit = (float(s["strike"]) - float(b["strike"])) - debit
-                if max_profit <= 0:
-                    continue
-                rr = max_profit / debit
-                rows.append({
-                    "strategy":"Bull Call Spread",
-                    "buy": b["option_symbol"], "sell": s["option_symbol"],
-                    "K_buy": float(b["strike"]), "K_sell": float(s["strike"]),
-                    "P_buy": float(b["last_price"]), "P_sell": float(s["last_price"]),
-                    "debit": debit, "max_profit": max_profit, "rr": rr
-                })
-    else:
-        puts = d[d["option_type"]=="PUT"].copy()
-        buy = puts[puts["moneyness"]=="ATM"].copy()
-        sell = puts[puts["moneyness"]=="OTM"].copy()
-
-        if regime == "Alta":
-            buy["delta"] = pd.to_numeric(buy.get("delta", np.nan), errors="coerce")
-            buy = buy[(buy["delta"].isna()) | (buy["delta"] <= -0.45)].copy()
-
-        for _, b in buy.iterrows():
-            cand = sell[sell["strike"] < b["strike"]].sort_values("strike", ascending=False).head(12)
-            for _, s in cand.iterrows():
-                debit = float(b["last_price"]) - float(s["last_price"])
-                if debit <= 0:
-                    continue
-                max_profit = (float(b["strike"]) - float(s["strike"])) - debit
-                if max_profit <= 0:
-                    continue
-                rr = max_profit / debit
-                rows.append({
-                    "strategy":"Bear Put Spread",
-                    "buy": b["option_symbol"], "sell": s["option_symbol"],
-                    "K_buy": float(b["strike"]), "K_sell": float(s["strike"]),
-                    "P_buy": float(b["last_price"]), "P_sell": float(s["last_price"]),
-                    "debit": debit, "max_profit": max_profit, "rr": rr
-                })
-
-    if not rows:
-        return pd.DataFrame()
-    return pd.DataFrame(rows).sort_values(["rr","max_profit"], ascending=[False, False]).head(3)
-
-def top_straddles(df, expiry, regime: str, cfg: dict) -> pd.DataFrame:
-    """
-    Long Straddle:
-    - Works best with expectation of high realized move; we rank by liquidity and lower total premium.
-    - Regime-aware note: in Neutra, emphasize straddle (range breakout).
-    """
-    d = df[df["expiry_date"]==expiry].copy()
-    d["strike"] = pd.to_numeric(d["strike"], errors="coerce")
-    d["last_price"] = pd.to_numeric(d["last_price"], errors="coerce")
-    d = d.dropna(subset=["strike","last_price"]).copy()
-    d = d[d["last_price"] > 0].copy()
-
-    calls = d[(d["option_type"]=="CALL") & (d["moneyness"]=="ATM")].copy()
-    puts  = d[(d["option_type"]=="PUT")  & (d["moneyness"]=="ATM")].copy()
-
-    if calls.empty or puts.empty:
-        return pd.DataFrame()
-
-    rows = []
-    for _, c in calls.iterrows():
-        p_cand = puts.copy()
-        p_cand["dK"] = (p_cand["strike"] - c["strike"]).abs()
-        p = p_cand.sort_values(["dK","trades","volume"], ascending=[True, False, False]).head(1)
-        if p.empty:
-            continue
-        p = p.iloc[0]
-        prem = float(c["last_price"]) + float(p["last_price"])
-        liq = float(_liquidity_score(pd.DataFrame([c])).iloc[0]) + float(_liquidity_score(pd.DataFrame([p])).iloc[0])
-        rows.append({
-            "strategy": "Long Straddle (ATM)",
-            "call": c["option_symbol"],
-            "put": p["option_symbol"],
-            "K_call": float(c["strike"]),
-            "K_put": float(p["strike"]),
-            "P_call": float(c["last_price"]),
-            "P_put": float(p["last_price"]),
-            "premium_total": prem,
-            "liq": liq
-        })
-
-    if not rows:
-        return pd.DataFrame()
-
-    out = pd.DataFrame(rows).sort_values(["liq","premium_total"], ascending=[False, True]).head(3)
-    return out
-
-# ============================================================
-# SHORT CONDOR (PURE) — Calls and Puts (NOT iron condor)
-# ============================================================
-
-def _pick_nearest_strike_row(d: pd.DataFrame, targetK: float, avoid_symbols: set):
-    tmp = d.copy()
-    tmp["dist"] = (tmp["strike"] - targetK).abs()
-    tmp = tmp[~tmp["option_symbol"].isin(avoid_symbols)]
-    tmp = tmp.sort_values(["dist","trades","volume"], ascending=[True, False, False])
-    if tmp.empty:
-        return None
-    return tmp.iloc[0]
-
-def top_short_call_condors(df: pd.DataFrame, expiry: date, regime: str, cfg: dict) -> pd.DataFrame:
-    """
-    Short Call Condor (credit), pure CALLs:
-      SELL K1, BUY K2, BUY K3, SELL K4   (K1 < K2 < K3 < K4)
-
-    Regime:
-      - In Alta: avoid short call condor (can fight upside). If allow, push strikes farther OTM.
-      - In Baixa/Neutra: ok.
-    """
-    d = df[(df["expiry_date"]==expiry) & (df["option_type"]=="CALL")].copy()
-    d["strike"] = pd.to_numeric(d["strike"], errors="coerce")
-    d["last_price"] = pd.to_numeric(d["last_price"], errors="coerce")
-    d["delta"] = pd.to_numeric(d["delta"], errors="coerce")
-    d["trades"] = pd.to_numeric(d["trades"], errors="coerce").fillna(0)
-    d["volume"] = pd.to_numeric(d["volume"], errors="coerce").fillna(0)
-    d = d.dropna(subset=["strike","last_price","delta"]).copy()
-    d = d[d["last_price"] > 0].sort_values("strike")
-    if d.empty:
-        return pd.DataFrame()
-
-    # adjust delta bands per regime
-    if regime == "Alta":
-        sell_band = cfg["condor_call_sell_band_up"]   # e.g. (0.12, 0.22)
-        buy_band  = cfg["condor_call_buy_band_up"]    # e.g. (0.04, 0.10)
-    else:
-        sell_band = cfg["condor_call_sell_band"]
-        buy_band  = cfg["condor_call_buy_band"]
-
-    sells = d[d["delta"].between(*sell_band)].copy()
-    buys  = d[d["delta"].between(*buy_band)].copy()
-    if sells.empty or buys.empty:
-        return pd.DataFrame()
-
-    sells = sells.sort_values("strike").head(12)
-    rows = []
-
-    for i in range(min(len(sells), 8)):
-        for j in range(i+1, min(len(sells), 10)):
-            s1 = sells.iloc[i]
-            s4 = sells.iloc[j]
-            K1, K4 = float(s1["strike"]), float(s4["strike"])
-            if K4 <= K1:
-                continue
-
-            b_in = buys[(buys["strike"] > K1) & (buys["strike"] < K4)].copy()
-            if b_in.empty:
-                continue
-
-            gap = max((K4-K1)/3.0, 0.01)
-            targetK2 = K1 + gap
-            targetK3 = K4 - gap
-
-            avoid = {s1["option_symbol"], s4["option_symbol"]}
-            b2 = _pick_nearest_strike_row(b_in, targetK2, avoid)
-            if b2 is None:
-                continue
-            avoid.add(b2["option_symbol"])
-            b3 = _pick_nearest_strike_row(b_in, targetK3, avoid)
-            if b3 is None:
-                continue
-
-            K2, K3 = float(b2["strike"]), float(b3["strike"])
-            if not (K1 < K2 < K3 < K4):
-                continue
-
-            P_s1 = float(s1["last_price"])
-            P_s4 = float(s4["last_price"])
-            P_b2 = float(b2["last_price"])
-            P_b3 = float(b3["last_price"])
-
-            credit = (P_s1 + P_s4) - (P_b2 + P_b3)
-            if credit <= 0:
-                continue
-
-            w_left = (K2 - K1)
-            w_right = (K4 - K3)
-            max_loss_est = max(w_left, w_right) - credit
-            if max_loss_est <= 0:
-                continue
-
-            rr = credit / max_loss_est
-            liq = float(
-                _liquidity_score(pd.DataFrame([s1])).iloc[0]
-                + _liquidity_score(pd.DataFrame([b2])).iloc[0]
-                + _liquidity_score(pd.DataFrame([b3])).iloc[0]
-                + _liquidity_score(pd.DataFrame([s4])).iloc[0]
-            )
-
-            rows.append({
-                "strategy":"Short Call Condor (Credit)",
-                "sell_1": s1["option_symbol"],
-                "buy_2": b2["option_symbol"],
-                "buy_3": b3["option_symbol"],
-                "sell_4": s4["option_symbol"],
-                "K1": K1, "K2": K2, "K3": K3, "K4": K4,
-                "P_sell_1": P_s1, "P_buy_2": P_b2, "P_buy_3": P_b3, "P_sell_4": P_s4,
-                "credit": credit,
-                "max_loss_est": max_loss_est,
-                "cr": rr,
-                "liq": liq
-            })
-
-    if not rows:
-        return pd.DataFrame()
-
-    out = pd.DataFrame(rows)
-    out = out.sort_values(["cr","credit","liq"], ascending=[False, False, False]).head(3)
-    return out
-
-def top_short_put_condors(df: pd.DataFrame, expiry: date, regime: str, cfg: dict) -> pd.DataFrame:
-    """
-    Short Put Condor (credit), pure PUTs:
-      SELL K1, BUY K2, BUY K3, SELL K4   (K1 < K2 < K3 < K4)
-
-    Regime:
-      - In Baixa: avoid being too aggressive; push strikes farther OTM (smaller |delta|)
-      - In Alta/Neutra: base bands.
-    """
-    d = df[(df["expiry_date"]==expiry) & (df["option_type"]=="PUT")].copy()
-    d["strike"] = pd.to_numeric(d["strike"], errors="coerce")
-    d["last_price"] = pd.to_numeric(d["last_price"], errors="coerce")
-    d["delta"] = pd.to_numeric(d["delta"], errors="coerce")
-    d["trades"] = pd.to_numeric(d["trades"], errors="coerce").fillna(0)
-    d["volume"] = pd.to_numeric(d["volume"], errors="coerce").fillna(0)
-    d = d.dropna(subset=["strike","last_price","delta"]).copy()
-    d = d[d["last_price"] > 0].sort_values("strike")
-    if d.empty:
-        return pd.DataFrame()
-
-    if regime == "Baixa":
-        sell_band = cfg["condor_put_sell_band_down"]  # e.g. (-0.22, -0.12)
-        buy_band  = cfg["condor_put_buy_band_down"]   # e.g. (-0.10, -0.04)
-    else:
-        sell_band = cfg["condor_put_sell_band"]
-        buy_band  = cfg["condor_put_buy_band"]
-
-    sells = d[d["delta"].between(*sell_band)].copy()
-    buys  = d[d["delta"].between(*buy_band)].copy()
-    if sells.empty or buys.empty:
-        return pd.DataFrame()
-
-    sells = sells.sort_values("strike").head(12)
-    rows = []
-
-    for i in range(min(len(sells), 8)):
-        for j in range(i+1, min(len(sells), 10)):
-            s1 = sells.iloc[i]
-            s4 = sells.iloc[j]
-            K1, K4 = float(s1["strike"]), float(s4["strike"])
-            if K4 <= K1:
-                continue
-
-            b_in = buys[(buys["strike"] > K1) & (buys["strike"] < K4)].copy()
-            if b_in.empty:
-                continue
-
-            gap = max((K4-K1)/3.0, 0.01)
-            targetK2 = K1 + gap
-            targetK3 = K4 - gap
-
-            avoid = {s1["option_symbol"], s4["option_symbol"]}
-            b2 = _pick_nearest_strike_row(b_in, targetK2, avoid)
-            if b2 is None:
-                continue
-            avoid.add(b2["option_symbol"])
-            b3 = _pick_nearest_strike_row(b_in, targetK3, avoid)
-            if b3 is None:
-                continue
-
-            K2, K3 = float(b2["strike"]), float(b3["strike"])
-            if not (K1 < K2 < K3 < K4):
-                continue
-
-            P_s1 = float(s1["last_price"])
-            P_s4 = float(s4["last_price"])
-            P_b2 = float(b2["last_price"])
-            P_b3 = float(b3["last_price"])
-
-            credit = (P_s1 + P_s4) - (P_b2 + P_b3)
-            if credit <= 0:
-                continue
-
-            w_left = (K2 - K1)
-            w_right = (K4 - K3)
-            max_loss_est = max(w_left, w_right) - credit
-            if max_loss_est <= 0:
-                continue
-
-            rr = credit / max_loss_est
-            liq = float(
-                _liquidity_score(pd.DataFrame([s1])).iloc[0]
-                + _liquidity_score(pd.DataFrame([b2])).iloc[0]
-                + _liquidity_score(pd.DataFrame([b3])).iloc[0]
-                + _liquidity_score(pd.DataFrame([s4])).iloc[0]
-            )
-
-            rows.append({
-                "strategy":"Short Put Condor (Credit)",
-                "sell_1": s1["option_symbol"],
-                "buy_2": b2["option_symbol"],
-                "buy_3": b3["option_symbol"],
-                "sell_4": s4["option_symbol"],
-                "K1": K1, "K2": K2, "K3": K3, "K4": K4,
-                "P_sell_1": P_s1, "P_buy_2": P_b2, "P_buy_3": P_b3, "P_sell_4": P_s4,
-                "credit": credit,
-                "max_loss_est": max_loss_est,
-                "cr": rr,
-                "liq": liq
-            })
-
-    if not rows:
-        return pd.DataFrame()
-
-    out = pd.DataFrame(rows)
-    out = out.sort_values(["cr","credit","liq"], ascending=[False, False, False]).head(3)
-    return out
-
-# =========================
-# UI selection helper
+# UI helpers
 # =========================
 
 def selectable_table(df: pd.DataFrame, key: str, label: str):
-    """
-    Try clickable selection in st.dataframe; fallback to selectbox if unsupported.
-    Returns selected row index (int) or None.
-    """
     if df is None or df.empty:
         st.info("Sem operações candidatas para esta estratégia.")
         return None
@@ -948,6 +557,8 @@ def selectable_table(df: pd.DataFrame, key: str, label: str):
     disp = df.copy().reset_index(drop=True)
     st.caption(label)
 
+    # Streamlit versions differ: some don't support on_select/selection_mode
+    # + new API de width="stretch" (em vez de use_container_width=True)
     try:
         evt = st.dataframe(
             disp,
@@ -963,38 +574,655 @@ def selectable_table(df: pd.DataFrame, key: str, label: str):
                 return int(rows[0])
         return None
     except TypeError:
+        # Fallback (versões antigas)
+        try:
+            st.dataframe(disp, width="stretch", hide_index=True)
+        except TypeError:
+            st.dataframe(disp)  # fallback extremo
+
         options = [f"{i}: {disp.iloc[i].to_dict()}" for i in range(len(disp))]
         pick = st.selectbox("Escolha a operação para ver o payoff:", ["(nenhuma)"] + options, key=f"{key}_sb")
         if pick == "(nenhuma)":
             return None
         return int(pick.split(":")[0])
 
-def plot_smile(df: pd.DataFrame, expiry_date: date, option_type: str, spot: float):
-    d = df[(df["expiry_date"] == expiry_date) & (df["option_type"].str.upper() == option_type.upper())].copy()
-    d["iv"] = pd.to_numeric(d["iv"], errors="coerce")
-    d["strike"] = pd.to_numeric(d["strike"], errors="coerce")
-    d = d.dropna(subset=["iv","strike"]).sort_values("strike")
-    if d.empty:
-        st.info(f"Sem IV para {option_type} no vencimento {expiry_date}.")
-        return
-    fig = plt.figure()
-    plt.plot(d["strike"], d["iv"], marker="o", linestyle="-")
-    if spot is not None and np.isfinite(spot):
-        plt.axvline(x=float(spot))
-    plt.xlabel("Strike")
-    plt.ylabel("IV")
-    plt.title(f"Sorriso de Vol – {option_type} – {expiry_date}")
-    st.pyplot(fig, clear_figure=True)
-
-# =========================
-# Criteria display helpers
-# =========================
-
 def criteria_box(title: str, bullets: list[str], notes: list[str] | None = None):
     st.markdown(f"**Critérios – {title}:**")
     st.markdown("\n".join([f"- {b}" for b in bullets]))
     if notes:
         st.markdown("\n".join([f"> {n}" for n in notes]))
+
+def _ensure_date(x):
+    try:
+        return pd.to_datetime(x).date()
+    except Exception:
+        return x
+
+def _filter_expiry(df: pd.DataFrame, expiry: date | None):
+    if expiry is None:
+        return df.copy()
+    return df[df["expiry_date"] == expiry].copy()
+
+def _liquidity_score(df):
+    t = pd.to_numeric(df.get("trades", 0), errors="coerce").fillna(0)
+    v = pd.to_numeric(df.get("volume", 0), errors="coerce").fillna(0)
+    return t + np.log1p(v)
+
+# =========================
+# Liquidity: leg + pair criteria
+# =========================
+
+def _liq_raw(trades, volume):
+    t = float(trades) if np.isfinite(trades) else 0.0
+    v = float(volume) if np.isfinite(volume) else 0.0
+    return t + np.log1p(max(v, 0.0))
+
+def _liq_leg_from_row(row):
+    t = pd.to_numeric(row.get("trades", 0), errors="coerce")
+    v = pd.to_numeric(row.get("volume", 0), errors="coerce")
+    t = float(t) if pd.notna(t) else 0.0
+    v = float(v) if pd.notna(v) else 0.0
+    return _liq_raw(t, v), t, v
+
+def _liq_class_single(liq, trades, volume, cfg):
+    if trades < cfg["liq_min_trades"] or volume < cfg["liq_min_volume"]:
+        return "RUIM"
+    if liq >= cfg["liq_min_ok"]:
+        return "OK"
+    if liq >= cfg["liq_min_alert"]:
+        return "ALERTA"
+    return "RUIM"
+
+def _liq_pair_metrics(liq1, liq2):
+    mn = min(liq1, liq2)
+    mx = max(liq1, liq2)
+    ratio = (mn / mx) if mx > 0 else 0.0
+    return mn, mx, ratio
+
+def _liq_class_pair(min_liq, ratio, cfg):
+    if (min_liq >= cfg["liq_pair_min_ok"]) and (ratio >= cfg["liq_pair_ratio_ok"]):
+        return "OK"
+    if (min_liq >= cfg["liq_pair_min_alert"]) and (ratio >= cfg["liq_pair_ratio_alert"]):
+        return "ALERTA"
+    return "RUIM"
+
+def _liq_penalty(liq_class, cfg):
+    if liq_class == "OK":
+        return 0.0
+    if liq_class == "ALERTA":
+        return float(cfg["liq_penalty_alert"])
+    return float(cfg["liq_penalty_bad"])
+
+# =========================
+# Strategies
+# =========================
+
+def top_itm_buy_calls(df, expiry: date | None, cfg: dict, top_n: int) -> pd.DataFrame:
+    d = _filter_expiry(df, expiry)
+    d = d[d["option_type"].str.upper() == "CALL"].copy()
+
+    d["delta"] = pd.to_numeric(d.get("delta", np.nan), errors="coerce")
+    d["iv"] = pd.to_numeric(d.get("iv", np.nan), errors="coerce")
+    d["last_price"] = pd.to_numeric(d.get("last_price", np.nan), errors="coerce")
+    d["mispricing_pct"] = pd.to_numeric(d.get("mispricing_pct", np.nan), errors="coerce")
+
+    def dmin_for_reg(r):
+        if r == "Alta":
+            return cfg["deep_itm_delta_up"]
+        if r == "Baixa":
+            return cfg["deep_itm_delta_down"]
+        return cfg["deep_itm_delta_neutral"]
+
+    d = d[d["moneyness"] == "ITM"].copy()
+    if d.empty:
+        return d
+
+    d["dmin"] = d["regime"].apply(dmin_for_reg)
+    d = d[(d["delta"] >= d["dmin"]) & (d["iv"].notna()) & (d["last_price"] > 0)].copy()
+    if d.empty:
+        return d
+
+    d["liq"] = _liquidity_score(d)
+
+    d["liq_class"] = d.apply(lambda r: _liq_class_single(
+        liq=float(pd.to_numeric(r.get("liq", 0), errors="coerce") or 0),
+        trades=float(pd.to_numeric(r.get("trades", 0), errors="coerce") or 0),
+        volume=float(pd.to_numeric(r.get("volume", 0), errors="coerce") or 0),
+        cfg=cfg
+    ), axis=1)
+
+    if cfg.get("liq_single_filter_hard", True):
+        d = d[d["liq_class"].isin(["OK", "ALERTA"])].copy()
+        if d.empty:
+            return d
+
+    d["cheapness"] = d["mispricing_pct"].fillna(0)
+    d["score"] = (
+        d["liq"]
+        - (d["iv"].fillna(0) * 10.0)
+        + np.where(d["regime"] == "Baixa", (-d["cheapness"] * 0.5), 0.0)
+        - d["liq_class"].map(lambda c: _liq_penalty(c, cfg))
+    )
+
+    out = d.sort_values(["score", "liq"], ascending=[False, False]).head(top_n)
+    out["expiry_date"] = out["expiry_date"].apply(_ensure_date)
+    return out.drop(columns=["dmin"], errors="ignore")
+
+def top_sell_puts(df, expiry: date | None, cfg: dict, top_n: int) -> pd.DataFrame:
+    d = _filter_expiry(df, expiry)
+    d = d[d["option_type"].str.upper() == "PUT"].copy()
+
+    d["delta"] = pd.to_numeric(d.get("delta", np.nan), errors="coerce")
+    d["iv"] = pd.to_numeric(d.get("iv", np.nan), errors="coerce")
+    d["last_price"] = pd.to_numeric(d.get("last_price", np.nan), errors="coerce")
+    d["moneyness_dist"] = pd.to_numeric(d.get("moneyness_dist", np.nan), errors="coerce")
+
+    def bounds(r):
+        if r == "Baixa":
+            return cfg["put_delta_lo_bear"], cfg["put_delta_hi_bear"], cfg["put_min_otm_dist_bear"]
+        return cfg["put_delta_lo"], cfg["put_delta_hi"], 0.0
+
+    d = d[d["moneyness"].isin(["OTM", "ATM"])].copy()
+    if d.empty:
+        return d
+
+    d[["lo", "hi", "min_dist"]] = d["regime"].apply(lambda r: pd.Series(bounds(r)))
+    d = d[(d["delta"].between(d["lo"], d["hi"])) & (d["iv"].notna()) & (d["last_price"] > 0)].copy()
+    d = d[~((d["min_dist"] > 0) & ((d["moneyness"] != "OTM") | (d["moneyness_dist"] < d["min_dist"])))].copy()
+    if d.empty:
+        return d
+
+    d["liq"] = _liquidity_score(d)
+    d["liq_class"] = d.apply(lambda r: _liq_class_single(
+        liq=float(pd.to_numeric(r.get("liq", 0), errors="coerce") or 0),
+        trades=float(pd.to_numeric(r.get("trades", 0), errors="coerce") or 0),
+        volume=float(pd.to_numeric(r.get("volume", 0), errors="coerce") or 0),
+        cfg=cfg
+    ), axis=1)
+
+    if cfg.get("liq_single_filter_hard", True):
+        d = d[d["liq_class"].isin(["OK", "ALERTA"])].copy()
+        if d.empty:
+            return d
+
+    d["score"] = (
+        (d["iv"].fillna(0) * 100.0)
+        + (d["last_price"].fillna(0) * 5.0)
+        + d["liq"].fillna(0)
+        - d["liq_class"].map(lambda c: _liq_penalty(c, cfg))
+    )
+
+    out = d.sort_values(["score"], ascending=[False]).head(top_n)
+    out["expiry_date"] = out["expiry_date"].apply(_ensure_date)
+    return out.drop(columns=["lo", "hi", "min_dist"], errors="ignore")
+
+def top_covered_calls(df, expiry: date | None, cfg: dict, top_n: int) -> pd.DataFrame:
+    d = _filter_expiry(df, expiry)
+    d = d[d["option_type"].str.upper() == "CALL"].copy()
+
+    d["delta"] = pd.to_numeric(d.get("delta", np.nan), errors="coerce")
+    d["iv"] = pd.to_numeric(d.get("iv", np.nan), errors="coerce")
+    d["last_price"] = pd.to_numeric(d.get("last_price", np.nan), errors="coerce")
+
+    def params(r):
+        if r == "Alta":
+            return ["OTM"], cfg["cc_delta_up"]
+        if r == "Baixa":
+            return ["OTM", "ATM"], cfg["cc_delta_down"]
+        return ["OTM", "ATM"], cfg["cc_delta_neutral"]
+
+    d[["mset", "dlo", "dhi"]] = d["regime"].apply(lambda r: pd.Series([params(r)[0], params(r)[1][0], params(r)[1][1]]))
+
+    ok_m = d.apply(lambda x: x["moneyness"] in x["mset"], axis=1)
+    d = d[ok_m].copy()
+    d = d[(d["delta"].between(d["dlo"], d["dhi"])) & (d["iv"].notna()) & (d["last_price"] > 0)].copy()
+    if d.empty:
+        return d
+
+    d["liq"] = _liquidity_score(d)
+    d["liq_class"] = d.apply(lambda r: _liq_class_single(
+        liq=float(pd.to_numeric(r.get("liq", 0), errors="coerce") or 0),
+        trades=float(pd.to_numeric(r.get("trades", 0), errors="coerce") or 0),
+        volume=float(pd.to_numeric(r.get("volume", 0), errors="coerce") or 0),
+        cfg=cfg
+    ), axis=1)
+
+    if cfg.get("liq_single_filter_hard", True):
+        d = d[d["liq_class"].isin(["OK", "ALERTA"])].copy()
+        if d.empty:
+            return d
+
+    d["score"] = (
+        (d["last_price"].fillna(0) * 10.0)
+        + d["liq"].fillna(0)
+        - d["liq_class"].map(lambda c: _liq_penalty(c, cfg))
+    )
+
+    out = d.sort_values(["score"], ascending=[False]).head(top_n)
+    out["expiry_date"] = out["expiry_date"].apply(_ensure_date)
+    return out.drop(columns=["mset", "dlo", "dhi"], errors="ignore")
+
+def top_straddles(df, expiry: date | None, top_n: int, cfg: dict) -> pd.DataFrame:
+    d = _filter_expiry(df, expiry)
+    d["strike"] = pd.to_numeric(d.get("strike", np.nan), errors="coerce")
+    d["last_price"] = pd.to_numeric(d.get("last_price", np.nan), errors="coerce")
+    d = d.dropna(subset=["strike", "last_price"]).copy()
+    d = d[d["last_price"] > 0].copy()
+
+    calls = d[(d["option_type"].str.upper() == "CALL") & (d["moneyness"] == "ATM")].copy()
+    puts  = d[(d["option_type"].str.upper() == "PUT")  & (d["moneyness"] == "ATM")].copy()
+    if calls.empty or puts.empty:
+        return pd.DataFrame()
+
+    rows = []
+    calls = calls.sort_values(["ticker", "expiry_date", "trades", "volume"], ascending=[True, True, False, False]).head(200)
+    puts  = puts.sort_values(["ticker", "expiry_date", "trades", "volume"], ascending=[True, True, False, False]).head(200)
+
+    for _, c in calls.iterrows():
+        p_cand = puts[(puts["ticker"] == c["ticker"]) & (puts["expiry_date"] == c["expiry_date"])].copy()
+        if p_cand.empty:
+            continue
+        p_cand["dK"] = (p_cand["strike"] - c["strike"]).abs()
+        p = p_cand.sort_values(["dK", "trades", "volume"], ascending=[True, False, False]).head(1)
+        if p.empty:
+            continue
+        p = p.iloc[0]
+
+        liq_c, _, _ = _liq_leg_from_row(c)
+        liq_p, _, _ = _liq_leg_from_row(p)
+        min_liq, _, ratio = _liq_pair_metrics(liq_c, liq_p)
+        liq_class = _liq_class_pair(min_liq, ratio, cfg)
+
+        if (min_liq < cfg["liq_pair_hard_min"]) or (ratio < cfg["liq_pair_hard_ratio"]):
+            continue
+
+        prem = float(c["last_price"]) + float(p["last_price"])
+        rows.append({
+            "strategy": "Long Straddle (ATM)",
+            "ticker": c["ticker"],
+            "trade_date": c["trade_date"],
+            "expiry_date": _ensure_date(c["expiry_date"]),
+            "spot_ref": float(c["spot_ref"]) if pd.notna(c["spot_ref"]) else np.nan,
+            "call": c["option_symbol"],
+            "put": p["option_symbol"],
+            "K": float(c["strike"]),
+            "P_call": float(c["last_price"]),
+            "P_put": float(p["last_price"]),
+            "premium_total": prem,
+            "liq_call": liq_c,
+            "liq_put": liq_p,
+            "liq_min": min_liq,
+            "liq_ratio": ratio,
+            "liq_class": liq_class,
+            "regime": c.get("regime", "N/A")
+        })
+
+    if not rows:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(rows)
+    out["premium_total"] = pd.to_numeric(out["premium_total"], errors="coerce")
+    out["liq_min"] = pd.to_numeric(out["liq_min"], errors="coerce")
+    out = out.sort_values(["liq_min", "premium_total"], ascending=[False, True]).head(top_n)
+    return out
+
+# ---- Spreads: DEBIT
+
+def _top_vertical_spreads_debit_one_expiry(df, expiry: date, kind="bull_call", top_n: int = 5, cfg: dict | None = None) -> pd.DataFrame:
+    if cfg is None:
+        cfg = {}
+
+    d = df[df["expiry_date"] == expiry].copy()
+    d["strike"] = pd.to_numeric(d.get("strike", np.nan), errors="coerce")
+    d["last_price"] = pd.to_numeric(d.get("last_price", np.nan), errors="coerce")
+    d = d.dropna(subset=["strike", "last_price"]).copy()
+    d = d[d["last_price"] > 0].copy()
+
+    rows = []
+
+    if kind == "bull_call":
+        calls = d[d["option_type"].str.upper() == "CALL"].copy()
+        buy = calls[calls["moneyness"] == "ATM"].copy()
+        sell = calls[calls["moneyness"] == "OTM"].copy()
+
+        buy = buy.sort_values(["ticker", "trades", "volume"], ascending=[True, False, False]).head(120)
+        sell = sell.sort_values(["ticker", "trades", "volume"], ascending=[True, False, False]).head(240)
+
+        for _, b in buy.iterrows():
+            cand = sell[(sell["ticker"] == b["ticker"]) & (sell["strike"] > b["strike"])].sort_values("strike").head(18)
+            for _, s in cand.iterrows():
+                debit = float(b["last_price"]) - float(s["last_price"])
+                if debit <= 0:
+                    continue
+                max_profit = (float(s["strike"]) - float(b["strike"])) - debit
+                if max_profit <= 0:
+                    continue
+                rr = max_profit / debit
+
+                liq_b, _, _ = _liq_leg_from_row(b)
+                liq_s, _, _ = _liq_leg_from_row(s)
+                min_liq, _, ratio = _liq_pair_metrics(liq_b, liq_s)
+                liq_class = _liq_class_pair(min_liq, ratio, cfg)
+
+                if (min_liq < cfg["liq_pair_hard_min"]) or (ratio < cfg["liq_pair_hard_ratio"]):
+                    continue
+
+                rows.append({
+                    "strategy": "Bull Call Spread (Debit)",
+                    "ticker": b["ticker"],
+                    "trade_date": b["trade_date"],
+                    "expiry_date": _ensure_date(expiry),
+                    "spot_ref": float(b["spot_ref"]) if pd.notna(b["spot_ref"]) else np.nan,
+                    "buy": b["option_symbol"],
+                    "sell": s["option_symbol"],
+                    "K_buy": float(b["strike"]),
+                    "K_sell": float(s["strike"]),
+                    "P_buy": float(b["last_price"]),
+                    "P_sell": float(s["last_price"]),
+                    "debit": debit,
+                    "max_profit_est": max_profit,
+                    "rr": rr,
+                    "liq_buy": liq_b,
+                    "liq_sell": liq_s,
+                    "liq_min": min_liq,
+                    "liq_ratio": ratio,
+                    "liq_class": liq_class,
+                    "regime": b.get("regime", "N/A")
+                })
+    else:
+        puts = d[d["option_type"].str.upper() == "PUT"].copy()
+        buy = puts[puts["moneyness"] == "ATM"].copy()
+        sell = puts[puts["moneyness"] == "OTM"].copy()
+
+        buy = buy.sort_values(["ticker", "trades", "volume"], ascending=[True, False, False]).head(120)
+        sell = sell.sort_values(["ticker", "trades", "volume"], ascending=[True, False, False]).head(240)
+
+        for _, b in buy.iterrows():
+            cand = sell[(sell["ticker"] == b["ticker"]) & (sell["strike"] < b["strike"])].sort_values("strike", ascending=False).head(18)
+            for _, s in cand.iterrows():
+                debit = float(b["last_price"]) - float(s["last_price"])
+                if debit <= 0:
+                    continue
+                max_profit = (float(b["strike"]) - float(s["strike"])) - debit
+                if max_profit <= 0:
+                    continue
+                rr = max_profit / debit
+
+                liq_b, _, _ = _liq_leg_from_row(b)
+                liq_s, _, _ = _liq_leg_from_row(s)
+                min_liq, _, ratio = _liq_pair_metrics(liq_b, liq_s)
+                liq_class = _liq_class_pair(min_liq, ratio, cfg)
+
+                if (min_liq < cfg["liq_pair_hard_min"]) or (ratio < cfg["liq_pair_hard_ratio"]):
+                    continue
+
+                rows.append({
+                    "strategy": "Bear Put Spread (Debit)",
+                    "ticker": b["ticker"],
+                    "trade_date": b["trade_date"],
+                    "expiry_date": _ensure_date(expiry),
+                    "spot_ref": float(b["spot_ref"]) if pd.notna(b["spot_ref"]) else np.nan,
+                    "buy": b["option_symbol"],
+                    "sell": s["option_symbol"],
+                    "K_buy": float(b["strike"]),
+                    "K_sell": float(s["strike"]),
+                    "P_buy": float(b["last_price"]),
+                    "P_sell": float(s["last_price"]),
+                    "debit": debit,
+                    "max_profit_est": max_profit,
+                    "rr": rr,
+                    "liq_buy": liq_b,
+                    "liq_sell": liq_s,
+                    "liq_min": min_liq,
+                    "liq_ratio": ratio,
+                    "liq_class": liq_class,
+                    "regime": b.get("regime", "N/A")
+                })
+
+    if not rows:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(rows)
+    out["rr_adj"] = out["rr"] - out["liq_class"].map(lambda c: _liq_penalty(c, cfg) * 0.05)
+    return out.sort_values(["rr_adj", "max_profit_est", "liq_min"], ascending=[False, False, False]).head(top_n)
+
+def top_vertical_spreads_debit(df, expiry: date | None, top_n: int, cfg: dict):
+    expiries = sorted(df["expiry_date"].dropna().unique().tolist())
+    expiries = [pd.to_datetime(x).date() for x in expiries]
+
+    if expiry is not None:
+        bull = _top_vertical_spreads_debit_one_expiry(df, expiry, kind="bull_call", top_n=top_n, cfg=cfg)
+        bear = _top_vertical_spreads_debit_one_expiry(df, expiry, kind="bear_put", top_n=top_n, cfg=cfg)
+        return bull, bear
+
+    all_bull, all_bear = [], []
+    for ex in expiries:
+        b = _top_vertical_spreads_debit_one_expiry(df, ex, kind="bull_call", top_n=top_n, cfg=cfg)
+        p = _top_vertical_spreads_debit_one_expiry(df, ex, kind="bear_put", top_n=top_n, cfg=cfg)
+        if not b.empty: all_bull.append(b)
+        if not p.empty: all_bear.append(p)
+
+    bull = pd.concat(all_bull, ignore_index=True) if all_bull else pd.DataFrame()
+    bear = pd.concat(all_bear, ignore_index=True) if all_bear else pd.DataFrame()
+
+    if not bull.empty:
+        bull = bull.sort_values(["rr_adj", "max_profit_est", "liq_min"], ascending=[False, False, False]).head(top_n)
+    if not bear.empty:
+        bear = bear.sort_values(["rr_adj", "max_profit_est", "liq_min"], ascending=[False, False, False]).head(top_n)
+
+    return bull, bear
+
+# ---- Spreads: CREDIT
+
+def _top_credit_spreads_one_expiry(df, expiry: date, kind="bull_put", cfg: dict | None = None, top_n: int = 5) -> pd.DataFrame:
+    if cfg is None:
+        cfg = {}
+
+    d = df[df["expiry_date"] == expiry].copy()
+    d["strike"] = pd.to_numeric(d.get("strike", np.nan), errors="coerce")
+    d["last_price"] = pd.to_numeric(d.get("last_price", np.nan), errors="coerce")
+    d["delta"] = pd.to_numeric(d.get("delta", np.nan), errors="coerce")
+    d["trades"] = pd.to_numeric(d.get("trades", 0), errors="coerce").fillna(0)
+    d["volume"] = pd.to_numeric(d.get("volume", 0), errors="coerce").fillna(0)
+    d = d.dropna(subset=["strike", "last_price"]).copy()
+    d = d[d["last_price"] > 0].copy()
+
+    rows = []
+
+    if kind == "bull_put":
+        puts = d[d["option_type"].str.upper() == "PUT"].copy().sort_values("strike")
+
+        for ticker, dd in puts.groupby("ticker"):
+            reg = str(dd["regime"].iloc[0]) if "regime" in dd.columns and len(dd) else "N/A"
+            if reg == "Baixa":
+                sell_band = cfg.get("bps_put_sell_band_down", (-0.25, -0.12))
+                buy_band  = cfg.get("bps_put_buy_band_down",  (-0.12, -0.04))
+            else:
+                sell_band = cfg.get("bps_put_sell_band", (-0.30, -0.15))
+                buy_band  = cfg.get("bps_put_buy_band",  (-0.15, -0.05))
+
+            sells = dd[dd["delta"].between(*sell_band)].copy()
+            buys  = dd[dd["delta"].between(*buy_band)].copy()
+
+            if sells.empty:
+                sells = dd[dd["moneyness"].isin(["OTM", "ATM"])].copy()
+            if buys.empty:
+                buys = dd[dd["moneyness"].isin(["OTM"])].copy()
+
+            sells = sells.sort_values(["trades", "volume"], ascending=[False, False]).head(16)
+            buys  = buys.sort_values(["trades", "volume"], ascending=[False, False]).head(32)
+
+            for _, s in sells.iterrows():
+                cand = buys[buys["strike"] < s["strike"]].sort_values("strike", ascending=False).head(18)
+                for _, b in cand.iterrows():
+                    credit = float(s["last_price"]) - float(b["last_price"])
+                    if credit <= 0:
+                        continue
+                    width = float(s["strike"]) - float(b["strike"])
+                    if width <= 0:
+                        continue
+                    max_loss = width - credit
+                    if max_loss <= 0:
+                        continue
+                    cr = credit / max_loss
+
+                    liq_s, _, _ = _liq_leg_from_row(s)
+                    liq_b, _, _ = _liq_leg_from_row(b)
+                    min_liq, _, ratio = _liq_pair_metrics(liq_s, liq_b)
+                    liq_class = _liq_class_pair(min_liq, ratio, cfg)
+
+                    if (min_liq < cfg["liq_pair_hard_min"]) or (ratio < cfg["liq_pair_hard_ratio"]):
+                        continue
+
+                    rows.append({
+                        "strategy": "Bull Put Spread (Credit)",
+                        "ticker": ticker,
+                        "trade_date": s["trade_date"],
+                        "expiry_date": _ensure_date(expiry),
+                        "spot_ref": float(s["spot_ref"]) if pd.notna(s["spot_ref"]) else np.nan,
+                        "sell": s["option_symbol"],
+                        "buy":  b["option_symbol"],
+                        "K_sell": float(s["strike"]),
+                        "K_buy":  float(b["strike"]),
+                        "P_sell": float(s["last_price"]),
+                        "P_buy":  float(b["last_price"]),
+                        "credit": credit,
+                        "width": width,
+                        "max_loss_est": max_loss,
+                        "cr": cr,
+                        "liq_sell": liq_s,
+                        "liq_buy": liq_b,
+                        "liq_min": min_liq,
+                        "liq_ratio": ratio,
+                        "liq_class": liq_class,
+                        "regime": reg
+                    })
+    else:
+        calls = d[d["option_type"].str.upper() == "CALL"].copy().sort_values("strike")
+
+        for ticker, dd in calls.groupby("ticker"):
+            reg = str(dd["regime"].iloc[0]) if "regime" in dd.columns and len(dd) else "N/A"
+            if reg == "Alta":
+                sell_band = cfg.get("bcs_call_sell_band_up", (0.12, 0.22))
+                buy_band  = cfg.get("bcs_call_buy_band_up",  (0.04, 0.10))
+            else:
+                sell_band = cfg.get("bcs_call_sell_band", (0.15, 0.30))
+                buy_band  = cfg.get("bcs_call_buy_band",  (0.05, 0.15))
+
+            sells = dd[dd["delta"].between(*sell_band)].copy()
+            buys  = dd[dd["delta"].between(*buy_band)].copy()
+
+            if sells.empty:
+                sells = dd[dd["moneyness"].isin(["OTM", "ATM"])].copy()
+            if buys.empty:
+                buys = dd[dd["moneyness"].isin(["OTM"])].copy()
+
+            sells = sells.sort_values(["trades", "volume"], ascending=[False, False]).head(16)
+            buys  = buys.sort_values(["trades", "volume"], ascending=[False, False]).head(32)
+
+            for _, s in sells.iterrows():
+                cand = buys[buys["strike"] > s["strike"]].sort_values("strike").head(18)
+                for _, b in cand.iterrows():
+                    credit = float(s["last_price"]) - float(b["last_price"])
+                    if credit <= 0:
+                        continue
+                    width = float(b["strike"]) - float(s["strike"])
+                    if width <= 0:
+                        continue
+                    max_loss = width - credit
+                    if max_loss <= 0:
+                        continue
+                    cr = credit / max_loss
+
+                    liq_s, _, _ = _liq_leg_from_row(s)
+                    liq_b, _, _ = _liq_leg_from_row(b)
+                    min_liq, _, ratio = _liq_pair_metrics(liq_s, liq_b)
+                    liq_class = _liq_class_pair(min_liq, ratio, cfg)
+
+                    if (min_liq < cfg["liq_pair_hard_min"]) or (ratio < cfg["liq_pair_hard_ratio"]):
+                        continue
+
+                    rows.append({
+                        "strategy": "Bear Call Spread (Credit)",
+                        "ticker": ticker,
+                        "trade_date": s["trade_date"],
+                        "expiry_date": _ensure_date(expiry),
+                        "spot_ref": float(s["spot_ref"]) if pd.notna(s["spot_ref"]) else np.nan,
+                        "sell": s["option_symbol"],
+                        "buy":  b["option_symbol"],
+                        "K_sell": float(s["strike"]),
+                        "K_buy":  float(b["strike"]),
+                        "P_sell": float(s["last_price"]),
+                        "P_buy":  float(b["last_price"]),
+                        "credit": credit,
+                        "width": width,
+                        "max_loss_est": max_loss,
+                        "cr": cr,
+                        "liq_sell": liq_s,
+                        "liq_buy": liq_b,
+                        "liq_min": min_liq,
+                        "liq_ratio": ratio,
+                        "liq_class": liq_class,
+                        "regime": reg
+                    })
+
+    if not rows:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(rows)
+    out["cr_adj"] = out["cr"] - out["liq_class"].map(lambda c: _liq_penalty(c, cfg) * 0.05)
+    out = out.sort_values(["cr_adj", "credit", "liq_min"], ascending=[False, False, False]).head(top_n)
+    return out
+
+def top_credit_spreads(df, expiry: date | None, cfg: dict, top_n: int):
+    expiries = sorted(df["expiry_date"].dropna().unique().tolist())
+    expiries = [pd.to_datetime(x).date() for x in expiries]
+
+    if expiry is not None:
+        bps = _top_credit_spreads_one_expiry(df, expiry, kind="bull_put", cfg=cfg, top_n=top_n)
+        bcs = _top_credit_spreads_one_expiry(df, expiry, kind="bear_call", cfg=cfg, top_n=top_n)
+        return bps, bcs
+
+    all_bps, all_bcs = [], []
+    for ex in expiries:
+        a = _top_credit_spreads_one_expiry(df, ex, kind="bull_put", cfg=cfg, top_n=top_n)
+        b = _top_credit_spreads_one_expiry(df, ex, kind="bear_call", cfg=cfg, top_n=top_n)
+        if not a.empty: all_bps.append(a)
+        if not b.empty: all_bcs.append(b)
+
+    bps = pd.concat(all_bps, ignore_index=True) if all_bps else pd.DataFrame()
+    bcs = pd.concat(all_bcs, ignore_index=True) if all_bcs else pd.DataFrame()
+
+    if not bps.empty:
+        bps = bps.sort_values(["cr_adj", "credit", "liq_min"], ascending=[False, False, False]).head(top_n)
+    if not bcs.empty:
+        bcs = bcs.sort_values(["cr_adj", "credit", "liq_min"], ascending=[False, False, False]).head(top_n)
+
+    return bps, bcs
+
+# =========================
+# Smile plot
+# =========================
+
+def plot_smile(df: pd.DataFrame, ticker: str, expiry_date: date, option_type: str):
+    d = df[(df["ticker"] == ticker) & (df["expiry_date"] == expiry_date) & (df["option_type"].str.upper() == option_type.upper())].copy()
+    d["iv"] = pd.to_numeric(d.get("iv", np.nan), errors="coerce")
+    d["strike"] = pd.to_numeric(d.get("strike", np.nan), errors="coerce")
+    d = d.dropna(subset=["iv", "strike"]).sort_values("strike")
+    if d.empty:
+        st.info(f"Sem IV para {option_type} em {ticker} no vencimento {expiry_date}.")
+        return
+    spot = pd.to_numeric(d.get("spot_ref", np.nan), errors="coerce").dropna()
+    spot = float(spot.iloc[0]) if len(spot) else np.nan
+
+    fig = plt.figure()
+    plt.plot(d["strike"], d["iv"], marker="o", linestyle="-")
+    if np.isfinite(spot):
+        plt.axvline(x=float(spot))
+    plt.xlabel("Strike")
+    plt.ylabel("IV")
+    plt.title(f"Sorriso de Vol – {ticker} – {option_type} – {expiry_date}")
+    st.pyplot(fig, clear_figure=True)
 
 # =========================
 # App
@@ -1007,444 +1235,367 @@ if assets.empty:
     st.warning("Nenhum ativo em assets. Rode o pipeline primeiro.")
     st.stop()
 
-# Toggles payoff
+# Sidebar
+st.sidebar.markdown("## Universo")
+ticker_ui = st.sidebar.selectbox("Ativo (opcional)", ["(Todos)"] + assets["ticker"].tolist())
+
 st.sidebar.markdown("## Payoff (config)")
 show_pct = st.sidebar.toggle("Exibir payoff em % do spot", value=False)
 mult_100 = st.sidebar.toggle("Payoff por 100 ações (multiplicador=100)", value=True)
 multiplier = 100.0 if mult_100 else 1.0
 
-# Trend thresholds
 st.sidebar.markdown("## Tendência (daily_bars)")
 rsi_hi = st.sidebar.slider("RSI alto (força)", 50, 70, 55, 1)
 rsi_lo = st.sidebar.slider("RSI baixo (fraqueza)", 30, 50, 45, 1)
 
-ticker = st.sidebar.selectbox("Ativo", assets["ticker"].tolist())
-asset_id = int(assets.loc[assets["ticker"]==ticker, "id"].iloc[0])
+st.sidebar.markdown("## ATM")
+atm_mode_ui = st.sidebar.radio("ATM", options=["Faixa percentual", "Mais próximo"], index=0)
+atm_mode = "pct" if atm_mode_ui == "Faixa percentual" else "nearest"
+atm_pct = st.sidebar.slider("Faixa ATM (|K−S|/S)", 0.001, 0.05, 0.01, 0.001, disabled=(atm_mode != "pct"))
 
-trade_date = load_latest_trade_date(asset_id)
-if not trade_date:
-    st.warning("Sem dados em option_quote.")
-    st.stop()
+st.sidebar.markdown("## Liquidez (gates)")
+liq_single_filter_hard = st.sidebar.toggle("Filtrar RUIM (perna única)", value=True)
+liq_pair_filter_hard = st.sidebar.toggle("Filtrar RUIM (pares)", value=True)
 
-ind = load_daily_indicators(asset_id, trade_date)
-regime, up_score, down_score, reg_details = infer_regime(ind, rsi_hi=float(rsi_hi), rsi_lo=float(rsi_lo))
+# Universe filter (recommended)
+st.sidebar.markdown("## Filtro do universo (recomendado)")
+use_universe_filter = st.sidebar.toggle("Ativar filtro strike/delta/último/vol financeiro", value=True)
 
-spot = None
-hist_vol_annual = None
-if ind:
-    spot = _to_float(ind.get("close"))
-    hist_vol_annual = _to_float(ind.get("vol_annual"))
+mny_log_max = st.sidebar.slider("|ln(K/S)| máx", 0.10, 1.00, 0.40, 0.05)
+delta_abs_min = st.sidebar.slider("|delta| mín", 0.00, 0.50, 0.05, 0.01)
+last_price_min = st.sidebar.number_input("Último (last_price) mín", min_value=0.0, value=0.05, step=0.01)
 
-df = load_chain(asset_id, trade_date)
-if df.empty:
-    st.warning("Sem opções com trades>0 e last_price>0.")
-    st.stop()
+opt_contract_mult = st.sidebar.number_input("Multiplicador do contrato (p/ volume financeiro)", min_value=1, value=100, step=1)
+vol_fin_min = st.sidebar.number_input("Volume financeiro mín (R$)", min_value=0.0, value=5000.0, step=500.0)
 
-expiry_list = sorted(df["expiry_date"].dropna().unique().tolist())
-expiry_choice = st.sidebar.selectbox("Vencimento", [str(x) for x in expiry_list])
-expiry_sel = pd.to_datetime(expiry_choice).date()
+# Load data
+if ticker_ui == "(Todos)":
+    df_raw, meta = load_all_active_data(assets)
+    if df_raw.empty:
+        st.warning("Sem dados de opções (trades>0 e last_price>0) para os ativos ativos.")
+        st.stop()
+else:
+    asset_id = int(assets.loc[assets["ticker"] == ticker_ui, "id"].iloc[0])
+    td = load_latest_trade_date(asset_id)
+    if not td:
+        st.warning("Sem dados em option_quote para este ativo.")
+        st.stop()
+    ind = load_daily_indicators(asset_id, td) or {}
+    regime, up_score, down_score, reg_details = infer_regime(ind, rsi_hi=float(rsi_hi), rsi_lo=float(rsi_lo))
+    close = _to_float(ind.get("close"))
+    vol_annual = _to_float(ind.get("vol_annual"))
+    df_chain = load_chain(asset_id, td)
+    if df_chain.empty:
+        st.warning("Sem opções com trades>0 e last_price>0 para este ativo.")
+        st.stop()
+    if close is None or not np.isfinite(close) or close <= 0:
+        s2 = pd.to_numeric(df_chain.get("spot", np.nan), errors="coerce").dropna()
+        close = float(s2.iloc[0]) if len(s2) else None
 
-atm_mode_ui = st.sidebar.radio("ATM", options=["Faixa percentual","Mais próximo"], index=0)
-atm_mode = "pct" if atm_mode_ui=="Faixa percentual" else "nearest"
-atm_pct = st.sidebar.slider("Faixa ATM (|K−S|/S)", 0.001, 0.05, 0.01, 0.001, disabled=(atm_mode!="pct"))
+    df_raw = df_chain.copy()
+    df_raw["asset_id"] = asset_id
+    df_raw["ticker"] = ticker_ui
+    df_raw["trade_date"] = td
+    df_raw["spot_ref"] = close
+    df_raw["hist_vol_annual_ref"] = vol_annual
+    df_raw["regime"] = regime
+    df_raw["regime_up_score"] = up_score
+    df_raw["regime_down_score"] = down_score
 
-df2 = df[df["expiry_date"]==expiry_sel].copy()
+    meta = pd.DataFrame([{
+        "asset_id": asset_id,
+        "ticker": ticker_ui,
+        "trade_date": td,
+        "spot_ref": close,
+        "hist_vol_annual_ref": vol_annual,
+        "regime": regime,
+        "up_score": up_score,
+        "down_score": down_score,
+        "SMA_stack": reg_details.get("SMA_stack"),
+        "Close_vs_SMA50": reg_details.get("Close_vs_SMA50"),
+        "MACD_hist": reg_details.get("MACD_hist"),
+        "RSI": reg_details.get("RSI"),
+    }])
 
-# spot fallback if daily_bars not available
-if spot is None or not np.isfinite(spot):
-    s2 = pd.to_numeric(df2["spot"], errors="coerce").dropna()
-    spot = float(s2.iloc[0]) if len(s2) else None
+# Expiry selection
+expiry_list = sorted(df_raw["expiry_date"].dropna().unique().tolist())
+expiry_list = [pd.to_datetime(x).date() for x in expiry_list]
+expiry_ui = st.sidebar.selectbox("Vencimento (opcional)", ["(Todos)"] + [str(x) for x in expiry_list])
+expiry_sel = None if expiry_ui == "(Todos)" else pd.to_datetime(expiry_ui).date()
 
-df2 = classify_moneyness(df2, spot=spot if spot else np.nan, atm_mode=atm_mode, atm_pct=atm_pct)
+# Moneyness
+df2 = classify_moneyness_multi(df_raw.copy(), atm_mode=atm_mode, atm_pct=float(atm_pct))
 
-quote_ts = pd.to_datetime(df2["quote_collected_at"], errors="coerce").max()
-model_ts = pd.to_datetime(df2["model_collected_at"], errors="coerce").max()
-
-df2["rate_r"] = pd.to_numeric(df2["rate_r"], errors="coerce")
-r_expiry = float(df2["rate_r"].dropna().median()) if df2["rate_r"].notna().any() else np.nan
+# Apply universe filter
+cfg_univ = {
+    "mny_log_max": float(mny_log_max),
+    "delta_abs_min": float(delta_abs_min),
+    "last_price_min": float(last_price_min),
+    "vol_fin_min": float(vol_fin_min),
+    "opt_contract_mult": float(opt_contract_mult),
+}
+if use_universe_filter:
+    df2 = apply_universe_filter(df2, cfg_univ)
 
 # Header metrics
-c1,c2,c3,c4,c5,c6,c7 = st.columns(7)
-c1.metric("Ticker", ticker)
-c2.metric("Pregão", str(trade_date))
-c3.metric("Spot (close)", f"{spot:.4f}" if spot is not None else "N/A")
-c4.metric("Hist vol anual", f"{hist_vol_annual:.4f}" if hist_vol_annual is not None else "N/A")
-c5.metric("Vencimento", str(expiry_sel))
-c6.metric("r (curva via model)", f"{r_expiry:.4%}" if np.isfinite(r_expiry) else "N/A")
-c7.metric("Regime", regime)
+if ticker_ui == "(Todos)":
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Universo", f"{len(meta)} ativos")
+    c2.metric("Opções (linhas)", f"{len(df2):,}".replace(",", "."))
+    c3.metric("Vencimento", str(expiry_sel) if expiry_sel else "Todos")
+    if not meta.empty and "regime" in meta.columns:
+        c4.metric("Regimes", f"Alta={int((meta['regime']=='Alta').sum())} | Baixa={int((meta['regime']=='Baixa').sum())} | Neutra={int((meta['regime']=='Neutra').sum())}")
+else:
+    r = meta.iloc[0]
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Ticker", ticker_ui)
+    c2.metric("Pregão", str(r["trade_date"]))
+    c3.metric("Spot (close)", f"{float(r['spot_ref']):.4f}" if pd.notna(r["spot_ref"]) else "N/A")
+    c4.metric("Hist vol anual", f"{float(r['hist_vol_annual_ref']):.4f}" if pd.notna(r["hist_vol_annual_ref"]) else "N/A")
+    c5.metric("Vencimento", str(expiry_sel) if expiry_sel else "Todos")
+    c6.metric("Regime", str(r["regime"]))
 
-st.caption(f"Coleta quotes: {quote_ts} | Coleta model: {model_ts}")
-
-# Regime + indicators panel
 with st.expander("Tendência / Indicadores (daily_bars) usados nas estratégias", expanded=True):
-    if not ind:
-        st.info("Sem daily_bars para este pregão — o regime fica N/A e as estratégias usam critérios padrão.")
+    if ticker_ui == "(Todos)":
+        st.info("Modo (Todos os ativos): regimes e indicadores são mostrados por ativo.")
+        if not meta.empty:
+            st.dataframe(meta.sort_values(["ticker"]), width="stretch", hide_index=True)
+        else:
+            st.write("—")
     else:
-        st.markdown(
-            f"""
-**Regime inferido:** **{regime}** (up_score={up_score}, down_score={down_score})
+        st.dataframe(meta, width="stretch", hide_index=True)
 
-**Regras do regime (heurística):**
-- SMA: *stack* (SMA20/SMA50/SMA200) e close vs SMA50
-- MACD_hist: sinal (positivo/negativo)
-- RSI14: força (≥{rsi_hi}) / fraqueza (≤{rsi_lo})
-
-**Detalhes:**
-- SMA_stack: {reg_details.get("SMA_stack")}
-- Close_vs_SMA50: {reg_details.get("Close_vs_SMA50")}
-- MACD_hist: {reg_details.get("MACD_hist")}
-- RSI: {reg_details.get("RSI")}
-            """.strip()
-        )
-        cols = ["trade_date","close","vol_annual","sma_20","sma_50","sma_200","macd_hist","rsi_14","atr_14"]
-        st.dataframe(pd.DataFrame([{k: ind.get(k) for k in cols}]), width="stretch", hide_index=True)
-
-# =========================
-# Strategy configuration (regime-aware)
-# =========================
+# Config
 cfg = {
-    # Long deep ITM call deltas
+    # delta thresholds
     "deep_itm_delta_up": 0.75,
     "deep_itm_delta_neutral": 0.80,
     "deep_itm_delta_down": 0.85,
 
-    # Short put deltas
     "put_delta_lo": -0.35,
     "put_delta_hi": -0.10,
-    # bear regime: less aggressive
     "put_delta_lo_bear": -0.25,
     "put_delta_hi_bear": -0.08,
     "put_min_otm_dist_bear": 0.015,
 
-    # Covered call deltas
     "cc_delta_up": (0.12, 0.25),
     "cc_delta_neutral": (0.15, 0.30),
     "cc_delta_down": (0.20, 0.40),
 
-    # Condor delta bands
-    "condor_call_sell_band": (0.18, 0.32),
-    "condor_call_buy_band": (0.06, 0.16),
-    "condor_call_sell_band_up": (0.12, 0.22),   # farther OTM if uptrend
-    "condor_call_buy_band_up": (0.04, 0.10),
+    # credit spreads delta bands
+    "bps_put_sell_band": (-0.30, -0.15),
+    "bps_put_buy_band":  (-0.15, -0.05),
+    "bps_put_sell_band_down": (-0.25, -0.12),
+    "bps_put_buy_band_down":  (-0.12, -0.04),
 
-    "condor_put_sell_band": (-0.32, -0.18),
-    "condor_put_buy_band": (-0.16, -0.06),
-    "condor_put_sell_band_down": (-0.22, -0.12),  # farther OTM if downtrend
-    "condor_put_buy_band_down": (-0.10, -0.04),
+    "bcs_call_sell_band": (0.15, 0.30),
+    "bcs_call_buy_band":  (0.05, 0.15),
+    "bcs_call_sell_band_up": (0.12, 0.22),
+    "bcs_call_buy_band_up":  (0.04, 0.10),
+
+    # liquidity single-leg gates
+    "liq_min_trades": 5,
+    "liq_min_volume": 50,
+    "liq_min_ok": 8.0,
+    "liq_min_alert": 5.0,
+    "liq_penalty_alert": 1.0,
+    "liq_penalty_bad": 3.0,
+    "liq_single_filter_hard": bool(liq_single_filter_hard),
+
+    # liquidity pair gates
+    "liq_pair_min_ok": 6.0,
+    "liq_pair_min_alert": 4.0,
+    "liq_pair_ratio_ok": 0.40,
+    "liq_pair_ratio_alert": 0.25,
+    "liq_pair_hard_min": 3.0 if liq_pair_filter_hard else 0.0,
+    "liq_pair_hard_ratio": 0.20 if liq_pair_filter_hard else 0.0,
 }
 
-# =========================
-# Strategies + Payoff on select
-# =========================
-
-st.subheader("Top 3 por estratégia (seleção mostra payoff com break-even)")
-
-# Strategy criteria text (regime-aware)
-reg_note = {
-    "Alta": "Regime de alta: prioriza estruturas *bullish* e venda de calls mais OTM (evita limitar upside).",
-    "Baixa": "Regime de baixa: reduz agressividade em venda de puts e prioriza estruturas *bearish*.",
-    "Neutra": "Regime neutro: prioriza renda/estruturas com melhor RR e liquidez.",
-    "N/A": "Sem daily_bars: usa critérios padrão (sem ajuste por tendência)."
-}.get(regime, "—")
-
-st.info(reg_note)
+st.subheader(f"Top {TOP_N} por estratégia (considerando {'todos os ativos' if ticker_ui=='(Todos)' else 'o ativo selecionado'})")
 
 colA, colB = st.columns(2)
 
 with colA:
     st.markdown("### 1) Compra bem ITM (CALL deep ITM)")
-    if regime == "Alta":
-        criteria_box(
-            "Compra ITM",
-            [
-                f"CALL ITM (moneyness=ITM)",
-                f"delta ≥ {cfg['deep_itm_delta_up']:.2f}",
-                "trades>0 e last_price>0 (já filtrado na query)",
-                "ranking: maior liquidez (trades+log(1+volume)) e menor IV",
-            ],
-            ["Em alta, deep ITM dá exposição com menor vega relativa e menos ruído de IV."]
-        )
-    elif regime == "Baixa":
-        criteria_box(
-            "Compra ITM",
-            [
-                f"CALL ITM (moneyness=ITM)",
-                f"delta ≥ {cfg['deep_itm_delta_down']:.2f}",
-                "ranking: maior liquidez e preferência por mispricing_pct mais negativo (mais 'barata' vs BSM)",
-            ],
-            ["Em baixa, call deep ITM é mais defensiva; ainda assim, pode estar contra tendência."]
-        )
-    else:
-        criteria_box(
-            "Compra ITM",
-            [
-                f"CALL ITM (moneyness=ITM)",
-                f"delta ≥ {cfg['deep_itm_delta_neutral']:.2f}",
-                "ranking: maior liquidez e menor IV",
-            ]
-        )
-
-    t1 = top_itm_buy_calls(df2, expiry_sel, regime=regime, cfg=cfg)
+    criteria_box(
+        "Compra ITM",
+        [
+            "CALL ITM (moneyness=ITM)",
+            "delta mínimo depende do regime por ativo (Alta/Neutra/Baixa)",
+            "ranking: liquidez − 10×IV (e leve ajuste por mispricing em baixa) − penalidade liquidez",
+            f"gates liquidez: trades≥{cfg['liq_min_trades']} e volume≥{cfg['liq_min_volume']}",
+            "vencimento: " + ("Todos" if expiry_sel is None else str(expiry_sel)),
+        ]
+    )
+    t1 = top_itm_buy_calls(df2, expiry_sel, cfg=cfg, top_n=TOP_N)
     idx = selectable_table(format_table(t1), key="t1", label="Selecione uma operação para ver o payoff.")
     if idx is not None and not t1.empty:
         row = t1.iloc[idx]
+        spot = float(row["spot_ref"]) if pd.notna(row.get("spot_ref", np.nan)) else None
         op = {
-            "label": f"Compra ITM – LONG CALL {row['option_symbol']} (K={row['strike']}, prémio={row['last_price']})",
+            "label": f"{row['ticker']} | Compra ITM – LONG CALL {row['option_symbol']} (exp={_ensure_date(row['expiry_date'])}, K={row['strike']}, P={row['last_price']})",
             "legs": [{"type":"CALL","side":"LONG","K":float(row["strike"]),"premium":float(row["last_price"])}],
             "include_stock": False,
         }
         plot_payoff(op, spot, multiplier, show_pct)
 
-    st.markdown("### 2) Venda de PUTs (cash-secured / renda)")
-    if regime == "Baixa":
-        criteria_box(
-            "Venda de PUT",
-            [
-                f"PUT OTM (preferência), delta em [{cfg['put_delta_lo_bear']:.2f}, {cfg['put_delta_hi_bear']:.2f}]",
-                f"moneyness_dist ≥ {cfg['put_min_otm_dist_bear']:.3f} (mais longe do spot)",
-                "ranking: maior IV, maior prêmio e liquidez",
-            ],
-            ["Em baixa, vender put perto do dinheiro aumenta risco; por isso o filtro fica mais conservador."]
-        )
-    else:
-        criteria_box(
-            "Venda de PUT",
-            [
-                f"PUT OTM/ATM, delta em [{cfg['put_delta_lo']:.2f}, {cfg['put_delta_hi']:.2f}]",
-                "ranking: maior IV, maior prêmio e liquidez",
-            ],
-            ["Em alta/neutra, venda de put tende a ter melhor assimetria (se você aceita comprar o ativo)."]
-        )
-
-    t2 = top_sell_puts(df2, expiry_sel, regime=regime, cfg=cfg)
+    st.markdown("### 2) Venda de PUTs (renda)")
+    criteria_box(
+        "Venda de PUT",
+        [
+            "PUT OTM/ATM com delta em banda regime-aware (mais conservadora em baixa)",
+            "ranking: 100×IV + 5×prêmio + liq − penalidade liquidez",
+            "vencimento: " + ("Todos" if expiry_sel is None else str(expiry_sel)),
+        ]
+    )
+    t2 = top_sell_puts(df2, expiry_sel, cfg=cfg, top_n=TOP_N)
     idx2 = selectable_table(format_table(t2), key="t2", label="Selecione uma operação para ver o payoff.")
     if idx2 is not None and not t2.empty:
         row = t2.iloc[idx2]
+        spot = float(row["spot_ref"]) if pd.notna(row.get("spot_ref", np.nan)) else None
         op = {
-            "label": f"Venda de PUT – SHORT PUT {row['option_symbol']} (K={row['strike']}, prémio={row['last_price']})",
+            "label": f"{row['ticker']} | Venda de PUT – SHORT PUT {row['option_symbol']} (exp={_ensure_date(row['expiry_date'])}, K={row['strike']}, P={row['last_price']})",
             "legs": [{"type":"PUT","side":"SHORT","K":float(row["strike"]),"premium":float(row["last_price"])}],
             "include_stock": False,
         }
         plot_payoff(op, spot, multiplier, show_pct)
 
-    st.markdown("### 5) Long Straddle (ATM) – volatilidade / rompimento")
+    st.markdown("### 5) Long Straddle (ATM)")
     criteria_box(
         "Long Straddle",
         [
-            "BUY CALL ATM + BUY PUT ATM (mesmo vencimento)",
-            "ranking: maior liquidez e menor prêmio total",
-        ],
-        [
-            "Em regime neutro, straddle pode capturar rompimentos; em alta/baixa, avalie se prefere direcional (travas)."
+            "BUY CALL ATM + BUY PUT ATM (mesmo ticker e vencimento)",
+            "filtro: min_liq e simetria de liquidez (ratio)",
+            "ranking: maior liq_min e menor prêmio total",
         ]
     )
-    tS = top_straddles(df2, expiry_sel, regime=regime, cfg=cfg)
+    tS = top_straddles(df2, expiry_sel, top_n=TOP_N, cfg=cfg)
     idxS = selectable_table(tS, key="straddle", label="Selecione um straddle para ver o payoff.")
     if idxS is not None and not tS.empty:
         r = tS.iloc[idxS]
+        spot = float(r["spot_ref"]) if pd.notna(r.get("spot_ref", np.nan)) else None
         op = {
-            "label": (
-                f"Long Straddle – BUY {r['call']} (K={r['K_call']},P={r['P_call']}) + "
-                f"BUY {r['put']} (K={r['K_put']},P={r['P_put']})"
-            ),
+            "label": f"{r['ticker']} | Long Straddle – exp={_ensure_date(r['expiry_date'])} | BUY {r['call']} + BUY {r['put']}",
             "legs": [
-                {"type":"CALL","side":"LONG","K":float(r["K_call"]),"premium":float(r["P_call"])},
-                {"type":"PUT","side":"LONG","K":float(r["K_put"]),"premium":float(r["P_put"])},
+                {"type":"CALL","side":"LONG","K":float(r["K"]),"premium":float(r["P_call"])},
+                {"type":"PUT","side":"LONG","K":float(r["K"]),"premium":float(r["P_put"])},
             ],
             "include_stock": False,
         }
         plot_payoff(op, spot, multiplier, show_pct)
 
 with colB:
-    st.markdown("### 3) Travas (Bull Call / Bear Put) – Top RR")
-    if regime == "Alta":
-        criteria_box(
-            "Travas",
-            [
-                "Prioridade: Bull Call (debit) em alta",
-                "Bull: BUY CALL ATM, SELL CALL OTM",
-                "Bear: BUY PUT ATM, SELL PUT OTM (mostrado, mas tende a ser contra tendência)",
-                "ranking: melhor RR (max_profit/debit) e maior max_profit",
-            ]
-        )
-    elif regime == "Baixa":
-        criteria_box(
-            "Travas",
-            [
-                "Prioridade: Bear Put (debit) em baixa",
-                "Bear: BUY PUT ATM, SELL PUT OTM",
-                "Bull: BUY CALL ATM, SELL CALL OTM (mostrado, mas tende a ser contra tendência)",
-                "ranking: melhor RR (max_profit/debit) e maior max_profit",
-            ]
-        )
-    else:
-        criteria_box(
-            "Travas",
-            [
-                "Bull: BUY CALL ATM, SELL CALL OTM",
-                "Bear: BUY PUT ATM, SELL PUT OTM",
-                "ranking: melhor RR (max_profit/debit) e maior max_profit",
-            ]
-        )
+    st.markdown("### 3) Travas (Débito e Crédito) – comparáveis em abas")
+    criteria_box(
+        "Travas",
+        [
+            "Débito: Bull Call / Bear Put (rank por RR ajustado por liquidez)",
+            "Crédito: Bull Put / Bear Call (rank por CR ajustado por liquidez)",
+            "filtro: min_liq e simetria de liquidez (ratio)",
+        ]
+    )
 
-    bull = top_vertical_spreads(df2, expiry_sel, kind="bull_call", regime=regime, cfg=cfg)
-    bear = top_vertical_spreads(df2, expiry_sel, kind="bear_put", regime=regime, cfg=cfg)
+    tab_debit, tab_credit = st.tabs(["Travas no DÉBITO (RR)", "Travas no CRÉDITO (CR)"])
 
-    # Order tabs according to regime
-    if regime == "Baixa":
-        tab_first, tab_second = "Bear Put Spread", "Bull Call Spread"
-    else:
-        tab_first, tab_second = "Bull Call Spread", "Bear Put Spread"
+    with tab_debit:
+        bull_deb, bear_deb = top_vertical_spreads_debit(df2, expiry_sel, top_n=TOP_N, cfg=cfg)
+        tA, tB = st.tabs(["Bull Call (Debit)", "Bear Put (Debit)"])
 
-    tabs = st.tabs([tab_first, tab_second])
+        def _render_debit(tab, data):
+            with tab:
+                idx_sp = selectable_table(data, key=f"debit_{tab}", label="Selecione uma trava (débito) para ver o payoff.")
+                if idx_sp is not None and not data.empty:
+                    r = data.iloc[idx_sp]
+                    spot = float(r["spot_ref"]) if pd.notna(r.get("spot_ref", np.nan)) else None
+                    if "Bull Call" in r["strategy"]:
+                        op = {
+                            "label": f"{r['ticker']} | Bull Call (Debit) – exp={_ensure_date(r['expiry_date'])} | BUY {r['buy']} | SELL {r['sell']} (debit={r['debit']:.2f})",
+                            "legs": [
+                                {"type":"CALL","side":"LONG","K":float(r["K_buy"]),"premium":float(r["P_buy"])},
+                                {"type":"CALL","side":"SHORT","K":float(r["K_sell"]),"premium":float(r["P_sell"])},
+                            ],
+                            "include_stock": False,
+                        }
+                    else:
+                        op = {
+                            "label": f"{r['ticker']} | Bear Put (Debit) – exp={_ensure_date(r['expiry_date'])} | BUY {r['buy']} | SELL {r['sell']} (debit={r['debit']:.2f})",
+                            "legs": [
+                                {"type":"PUT","side":"LONG","K":float(r["K_buy"]),"premium":float(r["P_buy"])},
+                                {"type":"PUT","side":"SHORT","K":float(r["K_sell"]),"premium":float(r["P_sell"])},
+                            ],
+                            "include_stock": False,
+                        }
+                    plot_payoff(op, spot, multiplier, show_pct)
 
-    def _render_spread(tab, name, data):
-        with tab:
-            idx_sp = selectable_table(data, key=f"sp_{name}", label="Selecione uma trava para ver o payoff.")
-            if idx_sp is not None and not data.empty:
-                r = data.iloc[idx_sp]
-                if "Bull" in r["strategy"]:
-                    op = {
-                        "label": f"Bull Call Spread – BUY {r['buy']} | SELL {r['sell']} (debit={r['debit']:.2f})",
-                        "legs":[
-                            {"type":"CALL","side":"LONG","K":float(r["K_buy"]),"premium":float(r["P_buy"])},
-                            {"type":"CALL","side":"SHORT","K":float(r["K_sell"]),"premium":float(r["P_sell"])},
-                        ],
-                        "include_stock": False,
-                    }
-                else:
-                    op = {
-                        "label": f"Bear Put Spread – BUY {r['buy']} | SELL {r['sell']} (debit={r['debit']:.2f})",
-                        "legs":[
-                            {"type":"PUT","side":"LONG","K":float(r["K_buy"]),"premium":float(r["P_buy"])},
-                            {"type":"PUT","side":"SHORT","K":float(r["K_sell"]),"premium":float(r["P_sell"])},
-                        ],
-                        "include_stock": False,
-                    }
-                plot_payoff(op, spot, multiplier, show_pct)
+        _render_debit(tA, bull_deb)
+        _render_debit(tB, bear_deb)
 
-    if tab_first == "Bull Call Spread":
-        _render_spread(tabs[0], "bull", bull)
-        _render_spread(tabs[1], "bear", bear)
-    else:
-        _render_spread(tabs[0], "bear", bear)
-        _render_spread(tabs[1], "bull", bull)
+    with tab_credit:
+        bps, bcs = top_credit_spreads(df2, expiry_sel, cfg=cfg, top_n=TOP_N)
+        tC, tD = st.tabs(["Bull Put (Credit)", "Bear Call (Credit)"])
+
+        def _render_credit(tab, data):
+            with tab:
+                idx_cs = selectable_table(data, key=f"credit_{tab}", label="Selecione uma trava (crédito) para ver o payoff.")
+                if idx_cs is not None and not data.empty:
+                    r = data.iloc[idx_cs]
+                    spot = float(r["spot_ref"]) if pd.notna(r.get("spot_ref", np.nan)) else None
+                    if "Bull Put" in r["strategy"]:
+                        op = {
+                            "label": f"{r['ticker']} | Bull Put (Credit) – exp={_ensure_date(r['expiry_date'])} | SELL {r['sell']} | BUY {r['buy']} (credit={r['credit']:.2f})",
+                            "legs": [
+                                {"type":"PUT","side":"SHORT","K":float(r["K_sell"]),"premium":float(r["P_sell"])},
+                                {"type":"PUT","side":"LONG", "K":float(r["K_buy"]), "premium":float(r["P_buy"])},
+                            ],
+                            "include_stock": False,
+                        }
+                    else:
+                        op = {
+                            "label": f"{r['ticker']} | Bear Call (Credit) – exp={_ensure_date(r['expiry_date'])} | SELL {r['sell']} | BUY {r['buy']} (credit={r['credit']:.2f})",
+                            "legs": [
+                                {"type":"CALL","side":"SHORT","K":float(r["K_sell"]),"premium":float(r["P_sell"])},
+                                {"type":"CALL","side":"LONG", "K":float(r["K_buy"]), "premium":float(r["P_buy"])},
+                            ],
+                            "include_stock": False,
+                        }
+                    plot_payoff(op, spot, multiplier, show_pct)
+
+        _render_credit(tC, bps)
+        _render_credit(tD, bcs)
 
     st.markdown("### 4) Venda coberta (1 ação + short CALL)")
-    if regime == "Alta":
-        criteria_box(
-            "Venda coberta",
-            [
-                "Preferir CALL OTM (evita limitar upside em tendência de alta)",
-                f"delta em [{cfg['cc_delta_up'][0]:.2f}, {cfg['cc_delta_up'][1]:.2f}]",
-                "ranking: maior prêmio e liquidez",
-            ]
-        )
-    elif regime == "Baixa":
-        criteria_box(
-            "Venda coberta",
-            [
-                "Permite OTM/ATM (melhor prêmio em baixa, mas maior risco de ficar travado)",
-                f"delta em [{cfg['cc_delta_down'][0]:.2f}, {cfg['cc_delta_down'][1]:.2f}]",
-                "ranking: maior prêmio e liquidez",
-            ]
-        )
-    else:
-        criteria_box(
-            "Venda coberta",
-            [
-                "OTM/ATM",
-                f"delta em [{cfg['cc_delta_neutral'][0]:.2f}, {cfg['cc_delta_neutral'][1]:.2f}]",
-                "ranking: maior prêmio e liquidez",
-            ]
-        )
-
-    t4 = top_covered_calls(df2, expiry_sel, regime=regime, cfg=cfg)
+    criteria_box(
+        "Venda coberta",
+        [
+            "CALL OTM/ATM (conforme regime por ativo) com delta em banda regime-aware",
+            "ranking: 10×prêmio + liq − penalidade liquidez",
+        ]
+    )
+    t4 = top_covered_calls(df2, expiry_sel, cfg=cfg, top_n=TOP_N)
     idx4 = selectable_table(format_table(t4), key="t4", label="Selecione uma operação para ver o payoff.")
     if idx4 is not None and not t4.empty:
         row = t4.iloc[idx4]
+        spot = float(row["spot_ref"]) if pd.notna(row.get("spot_ref", np.nan)) else None
         op = {
-            "label": f"Venda Coberta – STOCK + SHORT CALL {row['option_symbol']} (K={row['strike']}, prémio={row['last_price']})",
+            "label": f"{row['ticker']} | Venda Coberta – exp={_ensure_date(row['expiry_date'])} | STOCK + SHORT CALL {row['option_symbol']} (K={row['strike']}, P={row['last_price']})",
             "legs": [{"type":"CALL","side":"SHORT","K":float(row["strike"]),"premium":float(row["last_price"])}],
             "include_stock": True,
             "stock_qty": 1.0
         }
         plot_payoff(op, spot, multiplier, show_pct)
 
-    st.markdown("### 6) Short Condor Puro (CALLs / PUTs) – Top 3 (crédito)")
-    criteria_box(
-        "Short Condor (puro)",
-        [
-            "Condor de crédito: SELL K1, BUY K2, BUY K3, SELL K4 (todas CALLs ou todas PUTs)",
-            "Seleção via bandas de delta (sells ~0.25 / buys ~0.10) ajustadas por regime",
-            "ranking: maior credit-to-risk (cr) e maior crédito com liquidez",
-        ],
-        [
-            "Em alta, CALL-condor é mais conservador (deltas menores => strikes mais OTM).",
-            "Em baixa, PUT-condor é mais conservador (|delta| menor => strikes mais OTM)."
-        ]
-    )
-
-    tab1, tab2 = st.tabs(["Short Call Condor", "Short Put Condor"])
-
-    with tab1:
-        tCC = top_short_call_condors(df2, expiry_sel, regime=regime, cfg=cfg)
-        idxCC = selectable_table(tCC, key="short_call_condor", label="Selecione um short call condor para ver o payoff.")
-        if idxCC is not None and not tCC.empty:
-            r = tCC.iloc[idxCC]
-            op = {
-                "label": (
-                    f"Short Call Condor – "
-                    f"SELL {r['sell_1']} (K1={r['K1']},P={r['P_sell_1']}) | "
-                    f"BUY {r['buy_2']} (K2={r['K2']},P={r['P_buy_2']}) | "
-                    f"BUY {r['buy_3']} (K3={r['K3']},P={r['P_buy_3']}) | "
-                    f"SELL {r['sell_4']} (K4={r['K4']},P={r['P_sell_4']}) | "
-                    f"credit={r['credit']:.2f}"
-                ),
-                "legs": [
-                    {"type":"CALL","side":"SHORT","K":float(r["K1"]),"premium":float(r["P_sell_1"])},
-                    {"type":"CALL","side":"LONG","K":float(r["K2"]),"premium":float(r["P_buy_2"])},
-                    {"type":"CALL","side":"LONG","K":float(r["K3"]),"premium":float(r["P_buy_3"])},
-                    {"type":"CALL","side":"SHORT","K":float(r["K4"]),"premium":float(r["P_sell_4"])},
-                ],
-                "include_stock": False
-            }
-            plot_payoff(op, spot, multiplier, show_pct)
-
-    with tab2:
-        tPC = top_short_put_condors(df2, expiry_sel, regime=regime, cfg=cfg)
-        idxPC = selectable_table(tPC, key="short_put_condor", label="Selecione um short put condor para ver o payoff.")
-        if idxPC is not None and not tPC.empty:
-            r = tPC.iloc[idxPC]
-            op = {
-                "label": (
-                    f"Short Put Condor – "
-                    f"SELL {r['sell_1']} (K1={r['K1']},P={r['P_sell_1']}) | "
-                    f"BUY {r['buy_2']} (K2={r['K2']},P={r['P_buy_2']}) | "
-                    f"BUY {r['buy_3']} (K3={r['K3']},P={r['P_buy_3']}) | "
-                    f"SELL {r['sell_4']} (K4={r['K4']},P={r['P_sell_4']}) | "
-                    f"credit={r['credit']:.2f}"
-                ),
-                "legs": [
-                    {"type":"PUT","side":"SHORT","K":float(r["K1"]),"premium":float(r["P_sell_1"])},
-                    {"type":"PUT","side":"LONG","K":float(r["K2"]),"premium":float(r["P_buy_2"])},
-                    {"type":"PUT","side":"LONG","K":float(r["K3"]),"premium":float(r["P_buy_3"])},
-                    {"type":"PUT","side":"SHORT","K":float(r["K4"]),"premium":float(r["P_sell_4"])},
-                ],
-                "include_stock": False
-            }
-            plot_payoff(op, spot, multiplier, show_pct)
-
-# =========================
-# Table + smiles
-# =========================
-
-st.subheader("Tabela completa (filtros: trades>0 e last_price>0)")
+st.subheader("Tabela completa (filtros: trades>0 e last_price>0) – universo carregado")
 st.dataframe(format_table(df2), width="stretch", height=520, hide_index=True)
 
 st.subheader("Sorriso de Volatilidade (IV vs Strike)")
-cL, cR = st.columns(2)
-with cL:
-    plot_smile(df2, expiry_sel, "CALL", spot)
-with cR:
-    plot_smile(df2, expiry_sel, "PUT", spot)
+if ticker_ui == "(Todos)":
+    st.info("Para plotar sorriso de vol, selecione um ativo específico.")
+elif expiry_sel is None:
+    st.info("Selecione um vencimento específico para plotar o sorriso de vol (CALL/PUT).")
+else:
+    cL, cR = st.columns(2)
+    with cL:
+        plot_smile(df2, ticker_ui, expiry_sel, "CALL")
+    with cR:
+        plot_smile(df2, ticker_ui, expiry_sel, "PUT")
+
