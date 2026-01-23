@@ -1,25 +1,27 @@
-# Finance Options Dashboard (Modular)
+# Finance Options Dashboard — Modular (Parquet backend)
 
-Este pacote reorganiza o `app_streamlit_options.py` em módulos menores para facilitar a adição de novas estratégias.
+Versão **modular** do dashboard de opções, usando **arquivos Parquet** em vez de conexão com banco.
 
-## Como rodar
-1. Copie a pasta inteira para seu projeto (ou descompacte).
-2. Garanta um `.env` na mesma pasta do `app_streamlit_options.py` com:
-   - DB_HOST, DB_PORT, DB_USER, DB_PASSWORD (ou DB_PASS), DB_NAME
-3. Instale dependências:
-   - streamlit, pandas, numpy, pymysql, python-dotenv, matplotlib
-4. Rode:
-   ```bash
-   streamlit run app_streamlit_options.py
-   ```
+## Estrutura esperada de dados (Parquet)
+Por padrão, o app procura em `./data/`:
 
-## Estrutura
-- `db/` conexão e repositório de consultas
-- `features/` moneyness, liquidez, regime, payoff
-- `strategies/` cada estratégia em arquivo (plugin)
-- `ui/` widgets (tabela selecionável, formatador)
+- `data/assets.parquet`
+- `data/daily_bars.parquet`
+- `data/option_quote.parquet`
+- `data/option_model.parquet`
 
-## Booster Horizontal (PUTs)
-- Usa o vencimento selecionado como **curto**.
-- Para o **longo**, pega 2 ou 3 vencimentos à frente (`booster_long_steps`).
-- Payoff é uma **aproximação no vencimento curto**, com valor residual do longo proporcional ao tempo restante.
+Você pode sobrescrever via `.env`:
+
+```bash
+DATA_DIR=./data
+PATH_ASSETS=./data/assets.parquet
+PATH_DAILY=./data/daily_bars.parquet
+PATH_QUOTE=./data/option_quote.parquet
+PATH_MODEL=./data/option_model.parquet
+```
+
+## Rodando localmente
+```bash
+pip install -r requirements.txt
+streamlit run app_streamlit_options.py
+```

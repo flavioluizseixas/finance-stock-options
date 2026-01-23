@@ -1,54 +1,37 @@
-DEFAULT_TOP_N = 5
+import os
+
+DEFAULT_TOP_N = int(os.getenv("DEFAULT_TOP_N", "3"))
 
 DEFAULT_CFG = {
-    # --- deltas / bandas ---
-    "deep_itm_delta_up": 0.75,
-    "deep_itm_delta_neutral": 0.80,
-    "deep_itm_delta_down": 0.85,
+    # Liquidez — single
+    "liq_min_trades": float(os.getenv("LIQ_MIN_TRADES", "3")),
+    "liq_min_volume": float(os.getenv("LIQ_MIN_VOLUME", "100")),
+    "liq_min_ok": float(os.getenv("LIQ_MIN_OK", "4.0")),
+    "liq_min_alert": float(os.getenv("LIQ_MIN_ALERT", "2.5")),
+    "liq_penalty_alert": float(os.getenv("LIQ_PENALTY_ALERT", "0.25")),
+    "liq_penalty_bad": float(os.getenv("LIQ_PENALTY_BAD", "0.75")),
+    "liq_single_filter_hard": False,
 
-    "put_delta_lo": -0.35,
-    "put_delta_hi": -0.10,
-    "put_delta_lo_bear": -0.25,
-    "put_delta_hi_bear": -0.08,
-    "put_min_otm_dist_bear": 0.015,
+    # Liquidez — pair
+    "liq_pair_min_ok": float(os.getenv("LIQ_PAIR_MIN_OK", "6.0")),
+    "liq_pair_min_alert": float(os.getenv("LIQ_PAIR_MIN_ALERT", "4.0")),
+    "liq_pair_ratio_ok": float(os.getenv("LIQ_PAIR_RATIO_OK", "0.40")),
+    "liq_pair_ratio_alert": float(os.getenv("LIQ_PAIR_RATIO_ALERT", "0.20")),
+    "liq_pair_filter_hard": False,
+    "liq_pair_hard_min": 0.0,
+    "liq_pair_hard_ratio": 0.0,
 
-    "cc_delta_up": (0.12, 0.25),
-    "cc_delta_neutral": (0.15, 0.30),
-    "cc_delta_down": (0.20, 0.40),
-
-    # --- credit spreads delta bands ---
-    "bps_put_sell_band": (-0.30, -0.15),
-    "bps_put_buy_band":  (-0.15, -0.05),
-    "bps_put_sell_band_down": (-0.25, -0.12),
-    "bps_put_buy_band_down":  (-0.12, -0.04),
-
-    "bcs_call_sell_band": (0.15, 0.30),
-    "bcs_call_buy_band":  (0.05, 0.15),
-    "bcs_call_sell_band_up": (0.12, 0.22),
-    "bcs_call_buy_band_up":  (0.04, 0.10),
-
-    # --- liquidez (perna única) ---
-    "liq_min_trades": 5,
-    "liq_min_volume": 50,
-    "liq_min_ok": 8.0,
-    "liq_min_alert": 5.0,
-    "liq_penalty_alert": 1.0,
-    "liq_penalty_bad": 3.0,
-    "liq_single_filter_hard": True,
-
-    # --- liquidez (par) ---
-    "liq_pair_min_ok": 6.0,
-    "liq_pair_min_alert": 4.0,
-    "liq_pair_ratio_ok": 0.40,
-    "liq_pair_ratio_alert": 0.25,
-    "liq_pair_hard_min": 3.0,
-    "liq_pair_hard_ratio": 0.20,
-
-    # --- Booster horizontal ---
-    # 2 ou 3 vencimentos à frente
-    "booster_long_steps": 2,     # altere para 3 se quiser
-    "booster_put_delta_target": -0.25,
-    "booster_put_delta_band": 0.10,   # aceita deltas em [target-band, target+band]
-    "booster_use_same_strike": True,  # se False, permite pequena diferença de strike
-    "booster_max_strike_gap_pct": 0.02,
+    # Payoff
+    "payoff_default_lo_mult": float(os.getenv("PAYOFF_LO_MULT", "0.5")),
+    "payoff_default_hi_mult": float(os.getenv("PAYOFF_HI_MULT", "1.5")),
 }
+
+def env_paths(base_dir: str):
+    data_dir = os.getenv("DATA_DIR", os.path.join(base_dir, "data"))
+    return {
+        "DATA_DIR": data_dir,
+        "PATH_ASSETS": os.getenv("PATH_ASSETS", os.path.join(data_dir, "assets.parquet")),
+        "PATH_DAILY":  os.getenv("PATH_DAILY",  os.path.join(data_dir, "daily_bars.parquet")),
+        "PATH_QUOTE":  os.getenv("PATH_QUOTE",  os.path.join(data_dir, "option_quote.parquet")),
+        "PATH_MODEL":  os.getenv("PATH_MODEL",  os.path.join(data_dir, "option_model.parquet")),
+    }
