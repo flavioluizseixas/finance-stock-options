@@ -1,37 +1,51 @@
+# ui/widgets.py
 import pandas as pd
 import streamlit as st
 
-def selectable_table(df: pd.DataFrame, key: str, label: str):
-    if df is None or df.empty:
-        st.info("Sem operações candidatas para esta estratégia.")
-        return None
-
-    disp = df.copy().reset_index(drop=True)
-    st.caption(label)
-
-    try:
-        evt = st.dataframe(
-            disp,
-            use_container_width=True,
-            hide_index=True,
-            on_select="rerun",
-            selection_mode="single-row",
-            key=f"{key}_df",
-        )
-        if evt and getattr(evt, "selection", None):
-            rows = evt.selection.get("rows", [])
-            if rows:
-                return int(rows[0])
-        return None
-    except TypeError:
-        options = [f"{i}: {disp.iloc[i].to_dict()}" for i in range(len(disp))]
-        pick = st.selectbox("Escolha a operação para ver o payoff:", ["(nenhuma)"] + options, key=f"{key}_sb")
-        if pick == "(nenhuma)":
-            return None
-        return int(pick.split(":")[0])
-
-def format_table(df: pd.DataFrame):
+def format_table(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
+
     out = df.copy()
-    return out  # Mantemos simples; você pode plugar o formatter completo aqui.
+
+    # Exemplos de formatação segura (opcional)
+    # for c in out.columns:
+    #     if pd.api.types.is_float_dtype(out[c]):
+    #         out[c] = out[c].round(4)
+
+    return out
+
+def selectable_table(df: pd.DataFrame, key: str, label: str = "Selecione uma linha"):
+    """
+    Exibe um dataframe com seleção de linha via st.data_editor e retorna o índice selecionado (int) ou None.
+    """
+    if df is None or df.empty:
+        st.info("Sem dados para exibir.")
+        return None
+
+    dfx = df.reset_index(drop=True).copy()
+
+    # cria coluna de seleção
+    sel_col = "__sel__"
+    if sel_col not in dfx.columns:
+        dfx.insert(0, sel_col, False)
+
+    st.caption(label)
+
+    edited = st.data_editor(
+        dfx,
+        key=f"{key}_editor",
+        hide_index=True,
+        width="stretch",
+        height=min(420, 35 + 35 * (len(dfx) if len(dfx) < 10 else 10)),
+        column_config={
+            sel_col: st.column_config.CheckboxColumn(""),
+        },
+        disabled=[c for c in dfx.columns if c != sel_col],
+    )
+
+    # retorna a primeira linha marcada
+    picked = edited.index[edited[sel_col] == True].tolist()
+    if not picked:
+        return None
+    return int(picked[0])

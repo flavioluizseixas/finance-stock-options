@@ -1,4 +1,11 @@
+# env
 .env
+
+# caches Python (em qualquer pasta)
+**/__pycache__/
+**/*.py[cod]
+**/*$py.class
+
+# seus diretórios
 backup/
 cache_yf/
-__pycache__/

@@ -46,7 +46,7 @@ expiry_sel = sb["expiry_sel"]
 show_pct = sb["show_pct"]
 multiplier = sb["multiplier"]
 payoff_cfg = {
-    "range_mode": ("manual" if sb.get("payoff_range_mode")=="manual" else "auto"),
+    "range_mode": ("manual" if sb.get("payoff_range_mode") == "manual" else "auto"),
     "lo_mult": float(sb.get("payoff_lo_mult", 0.5)),
     "hi_mult": float(sb.get("payoff_hi_mult", 1.5)),
 }
@@ -66,22 +66,25 @@ cfg_univ = {
     "opt_contract_mult": sb["opt_contract_mult"],
 }
 
-df_raw=None
-meta=None
+df_raw = None
+meta = None
 
 if ticker_ui == "(Todos)":
-    all_rows=[]
-    meta_rows=[]
+    all_rows = []
+    meta_rows = []
     for _, a in assets.iterrows():
-        asset_id=int(a["id"]); ticker=str(a["ticker"])
-        td=load_latest_trade_date(asset_id)
-        if not td: 
+        asset_id = int(a["id"])
+        ticker = str(a["ticker"])
+        td = load_latest_trade_date(asset_id)
+        if not td:
             continue
-        ind=load_daily_indicators(asset_id, td) or {}
+
+        ind = load_daily_indicators(asset_id, td) or {}
         regime, up_score, down_score, reg_details = infer_regime(ind, rsi_hi=sb["rsi_hi"], rsi_lo=sb["rsi_lo"])
-        close=to_float(ind.get("close"))
-        vol_annual=to_float(ind.get("vol_annual"))
-        df_chain=load_chain(asset_id, td)
+        close = to_float(ind.get("close"))
+        vol_annual = to_float(ind.get("vol_annual"))
+
+        df_chain = load_chain(asset_id, td)
         if df_chain is None or df_chain.empty:
             continue
 
@@ -91,38 +94,52 @@ if ticker_ui == "(Todos)":
             s2 = pd.to_numeric(df_chain["spot"], errors="coerce").dropna()
             spot_m = float(s2.median()) if len(s2) else None
 
-        if close is None or not np.isfinite(close) or close<=0:
+        if close is None or not np.isfinite(close) or close <= 0:
             close = spot_m
-        elif spot_m is not None and np.isfinite(spot_m) and spot_m>0:
-            if abs(float(close)-float(spot_m))/float(spot_m) > 0.12:
+        elif spot_m is not None and np.isfinite(spot_m) and spot_m > 0:
+            if abs(float(close) - float(spot_m)) / float(spot_m) > 0.12:
                 close = spot_m
-        df_chain=df_chain.copy()
-        df_chain["asset_id"]=asset_id
-        df_chain["ticker"]=ticker
-        df_chain["trade_date"]=td
-        df_chain["spot_ref"]=close
-        df_chain["hist_vol_annual_ref"]=vol_annual
-        df_chain["regime"]=regime
-        df_chain["regime_up_score"]=up_score
-        df_chain["regime_down_score"]=down_score
+
+        df_chain = df_chain.copy()
+        df_chain["asset_id"] = asset_id
+        df_chain["ticker"] = ticker
+        df_chain["trade_date"] = td
+        df_chain["spot_ref"] = close
+        df_chain["hist_vol_annual_ref"] = vol_annual
+        df_chain["regime"] = regime
+        df_chain["regime_up_score"] = up_score
+        df_chain["regime_down_score"] = down_score
+
         all_rows.append(df_chain)
-        meta_rows.append({"asset_id":asset_id,"ticker":ticker,"trade_date":td,"spot_ref":close,"hist_vol_annual_ref":vol_annual,"regime":regime})
-    df_raw=pd.concat(all_rows, ignore_index=True) if all_rows else pd.DataFrame()
-    meta=pd.DataFrame(meta_rows)
+        meta_rows.append({
+            "asset_id": asset_id,
+            "ticker": ticker,
+            "trade_date": td,
+            "spot_ref": close,
+            "hist_vol_annual_ref": vol_annual,
+            "regime": regime
+        })
+
+    df_raw = pd.concat(all_rows, ignore_index=True) if all_rows else pd.DataFrame()
+    meta = pd.DataFrame(meta_rows)
+
     if df_raw.empty:
         st.warning("Sem dados de opções para os ativos ativos.")
         st.stop()
+
 else:
-    asset_id=int(assets.loc[assets["ticker"]==ticker_ui, "id"].iloc[0])
-    td=load_latest_trade_date(asset_id)
+    asset_id = int(assets.loc[assets["ticker"] == ticker_ui, "id"].iloc[0])
+    td = load_latest_trade_date(asset_id)
     if not td:
         st.warning("Sem dados em option_quote para este ativo.")
         st.stop()
-    ind=load_daily_indicators(asset_id, td) or {}
+
+    ind = load_daily_indicators(asset_id, td) or {}
     regime, up_score, down_score, reg_details = infer_regime(ind, rsi_hi=sb["rsi_hi"], rsi_lo=sb["rsi_lo"])
-    close=to_float(ind.get("close"))
-    vol_annual=to_float(ind.get("vol_annual"))
-    df_chain=load_chain(asset_id, td)
+    close = to_float(ind.get("close"))
+    vol_annual = to_float(ind.get("vol_annual"))
+
+    df_chain = load_chain(asset_id, td)
     if df_chain.empty:
         st.warning("Sem opções com trades>0 e last_price>0 para este ativo.")
         st.stop()
@@ -133,21 +150,30 @@ else:
         s2 = pd.to_numeric(df_chain["spot"], errors="coerce").dropna()
         spot_m = float(s2.median()) if len(s2) else None
 
-    if close is None or not np.isfinite(close) or close<=0:
+    if close is None or not np.isfinite(close) or close <= 0:
         close = spot_m
-    elif spot_m is not None and np.isfinite(spot_m) and spot_m>0:
-        if abs(float(close)-float(spot_m))/float(spot_m) > 0.12:
+    elif spot_m is not None and np.isfinite(spot_m) and spot_m > 0:
+        if abs(float(close) - float(spot_m)) / float(spot_m) > 0.12:
             close = spot_m
-    df_raw=df_chain.copy()
-    df_raw["asset_id"]=asset_id
-    df_raw["ticker"]=ticker_ui
-    df_raw["trade_date"]=td
-    df_raw["spot_ref"]=close
-    df_raw["hist_vol_annual_ref"]=vol_annual
-    df_raw["regime"]=regime
-    df_raw["regime_up_score"]=up_score
-    df_raw["regime_down_score"]=down_score
-    meta=pd.DataFrame([{"asset_id":asset_id,"ticker":ticker_ui,"trade_date":td,"spot_ref":close,"hist_vol_annual_ref":vol_annual,"regime":regime}])
+
+    df_raw = df_chain.copy()
+    df_raw["asset_id"] = asset_id
+    df_raw["ticker"] = ticker_ui
+    df_raw["trade_date"] = td
+    df_raw["spot_ref"] = close
+    df_raw["hist_vol_annual_ref"] = vol_annual
+    df_raw["regime"] = regime
+    df_raw["regime_up_score"] = up_score
+    df_raw["regime_down_score"] = down_score
+
+    meta = pd.DataFrame([{
+        "asset_id": asset_id,
+        "ticker": ticker_ui,
+        "trade_date": td,
+        "spot_ref": close,
+        "hist_vol_annual_ref": vol_annual,
+        "regime": regime
+    }])
 
 df2 = classify_moneyness_multi(df_raw.copy(), atm_mode=sb["atm_mode"], atm_pct=float(sb["atm_pct"]))
 if sb["use_universe_filter"]:
@@ -166,4 +192,4 @@ for stg in get_strategies():
             render_payoff(spec, multiplier=multiplier, show_pct=show_pct, payoff_cfg=payoff_cfg)
 
 st.subheader("Tabela completa – universo carregado")
-st.dataframe(format_table(df2), use_container_width=True, height=520, hide_index=True)
+st.dataframe(format_table(df2), width="stretch", height=520, hide_index=True)
