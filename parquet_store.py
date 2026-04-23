@@ -1,5 +1,5 @@
 import os
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -71,7 +71,7 @@ def table_path(table_name: str, base_dir: Optional[str] = None) -> Path:
 def read_parquet_safe(path: Path, columns: Optional[list[str]] = None) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame(columns=columns or [])
-    df = pd.read_parquet(path)
+    df = _normalize_frame_types(pd.read_parquet(path))
     if columns:
         for col in columns:
             if col not in df.columns:
@@ -82,7 +82,59 @@ def read_parquet_safe(path: Path, columns: Optional[list[str]] = None) -> pd.Dat
 
 def write_parquet(path: Path, df: pd.DataFrame) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(path, index=False)
+    _normalize_frame_types(df).to_parquet(path, index=False)
+
+
+def _normalize_int_series(series: pd.Series) -> pd.Series:
+    raw = series
+    if pd.api.types.is_datetime64_any_dtype(raw):
+        raw = raw.astype("int64", copy=False)
+    num = pd.to_numeric(raw, errors="coerce")
+    if num.isna().all():
+        return series
+    return num.round().astype("Int64")
+
+
+def _normalize_datetime_series(series: pd.Series, date_only: bool) -> pd.Series:
+    out = pd.to_datetime(series, errors="coerce")
+    if pd.api.types.is_datetime64tz_dtype(out):
+        out = out.dt.tz_convert(None)
+    if date_only:
+        out = out.dt.normalize()
+    return out
+
+
+def _looks_like_temporal_object(series: pd.Series) -> bool:
+    non_null = series.dropna()
+    if non_null.empty:
+        return False
+    sample = non_null.head(50)
+    return sample.map(lambda v: isinstance(v, (date, datetime, pd.Timestamp, np.datetime64))).all()
+
+
+def _normalize_frame_types(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+
+    out = df.copy()
+    int_cols = {"id", "asset_id", "vertex_bd", "is_active"}
+    date_cols = {"trade_date", "expiry_date"}
+    datetime_cols = {"created_at", "updated_at", "collected_at"}
+
+    for col in out.columns:
+        if col in int_cols:
+            out[col] = _normalize_int_series(out[col])
+            continue
+        if col in date_cols:
+            out[col] = _normalize_datetime_series(out[col], date_only=True)
+            continue
+        if col in datetime_cols:
+            out[col] = _normalize_datetime_series(out[col], date_only=False)
+            continue
+        if out[col].dtype == "object" and _looks_like_temporal_object(out[col]):
+            out[col] = _normalize_datetime_series(out[col], date_only=False)
+
+    return out
 
 
 def _safe_sort_series(series: pd.Series) -> pd.Series:
@@ -106,6 +158,31 @@ def _safe_sort_series(series: pd.Series) -> pd.Series:
     return series.map(normalize)
 
 
+def _concat_compat(frames: list[pd.DataFrame]) -> pd.DataFrame:
+    valid = [frame.copy() for frame in frames if frame is not None and not frame.empty]
+    if not valid:
+        return pd.DataFrame()
+    if len(valid) == 1:
+        return valid[0].reset_index(drop=True)
+
+    all_cols: list[str] = []
+    for frame in valid:
+        for col in frame.columns:
+            if col not in all_cols:
+                all_cols.append(col)
+
+    prepared = []
+    for frame in valid:
+        keep_cols = [col for col in frame.columns if not frame[col].isna().all()]
+        prepared.append(frame[keep_cols] if keep_cols else frame.iloc[:, 0:0])
+
+    merged = pd.concat(prepared, ignore_index=True, sort=False)
+    for col in all_cols:
+        if col not in merged.columns:
+            merged[col] = np.nan
+    return merged[all_cols]
+
+
 def upsert_parquet(
     path: Path,
     new_df: pd.DataFrame,
@@ -116,7 +193,12 @@ def upsert_parquet(
         return read_parquet_safe(path)
 
     current = read_parquet_safe(path)
-    merged = pd.concat([current, new_df], ignore_index=True, sort=False)
+    incoming = _normalize_frame_types(new_df)
+    merged = _concat_compat([current, incoming])
+    if merged.empty:
+        write_parquet(path, merged)
+        return merged
+
     merged = merged.drop_duplicates(subset=key_cols, keep="last")
 
     if sort_cols:

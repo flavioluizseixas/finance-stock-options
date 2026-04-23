@@ -146,6 +146,11 @@ def build_universe(selected_ticker: str) -> tuple[pd.DataFrame, pd.DataFrame]:
 
         close = to_float(indicators.get("close"))
         vol_annual = to_float(indicators.get("vol_annual"))
+        if vol_annual is None and "hist_vol_annual" in chain.columns:
+            hv_chain = pd.to_numeric(chain["hist_vol_annual"], errors="coerce").dropna()
+            hv_chain = hv_chain[hv_chain > 0]
+            if not hv_chain.empty:
+                vol_annual = float(hv_chain.iloc[-1])
         spot_from_model = pd.to_numeric(chain.get("spot"), errors="coerce").dropna()
         spot_ref = float(spot_from_model.median()) if len(spot_from_model) else close
         if close and spot_ref and abs(float(close) - float(spot_ref)) / float(spot_ref) <= 0.12:
@@ -208,21 +213,21 @@ with tab_update:
     selected = st.multiselect("Tickers para atualizar", options=cfg.tickers, default=cfg.tickers)
     col1, col2, col3 = st.columns(3)
 
-    if col1.button("Atualizar cotações do ativo", use_container_width=True):
+    if col1.button("Atualizar cotações do ativo", width="stretch"):
         with st.spinner("Baixando histórico do Yahoo Finance e recalculando indicadores..."):
             summary = run_market_update(update_quotes=True, update_options=False, selected_tickers=selected)
         clear_caches()
         st.success("Cotações e indicadores atualizados.")
-        st.dataframe(pd.DataFrame(summary["tickers"]), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(summary["tickers"]), width="stretch", hide_index=True)
 
-    if col2.button("Atualizar opções e gregas", use_container_width=True):
+    if col2.button("Atualizar opções e gregas", width="stretch"):
         with st.spinner("Coletando opções no opcoes.net e recalculando gregas..."):
             summary = run_market_update(update_quotes=True, update_options=True, selected_tickers=selected)
         clear_caches()
         st.success("Cotações, opções e gregas atualizadas.")
-        st.dataframe(pd.DataFrame(summary["tickers"]), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(summary["tickers"]), width="stretch", hide_index=True)
 
-    if col3.button("Recarregar arquivos parquet", use_container_width=True):
+    if col3.button("Recarregar arquivos parquet", width="stretch"):
         clear_caches()
         st.info("Caches locais do Streamlit foram limpos.")
 
@@ -290,7 +295,7 @@ with tab_recommendation:
         best_row = best["result"].table.iloc[0]
         st.success(f"{best['strategy'].name}")
         st.caption("A sugestão combina regime do ativo com o melhor candidato disponível entre as estratégias modeladas.")
-        st.dataframe(best["result"].table.head(3), use_container_width=True, hide_index=True)
+        st.dataframe(best["result"].table.head(3), width="stretch", hide_index=True)
         render_payoff(best["strategy"].payoff_spec(best_row, cfg), multiplier=multiplier, show_pct=show_pct, payoff_cfg=payoff_cfg)
 
     st.subheader("Ranking das estratégias")
@@ -304,7 +309,7 @@ with tab_recommendation:
             for item in ranked
         ]
     )
-    st.dataframe(ranking_df, use_container_width=True, hide_index=True)
+    st.dataframe(ranking_df, width="stretch", hide_index=True)
 
     st.subheader("Explorar candidatos por estratégia")
     for item in ranked:
@@ -330,4 +335,4 @@ with tab_universe:
         st.warning("Sem dados para montar o universo.")
         st.stop()
     df2 = classify_moneyness_multi(df_raw.copy(), atm_mode="pct", atm_pct=0.01)
-    st.dataframe(format_table(df2), use_container_width=True, height=580, hide_index=True)
+    st.dataframe(format_table(df2), width="stretch", height=580, hide_index=True)

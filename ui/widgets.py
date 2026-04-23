@@ -36,7 +36,7 @@ def selectable_table(df: pd.DataFrame, key: str, label: str = "Selecione uma lin
         dfx,
         key=f"{key}_editor",
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         height=min(420, 35 + 35 * (len(dfx) if len(dfx) < 10 else 10)),
         column_config={
             sel_col: st.column_config.CheckboxColumn(""),

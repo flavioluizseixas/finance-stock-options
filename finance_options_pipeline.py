@@ -125,7 +125,15 @@ def fetch_yf_history(ticker: str, start: str, last_dt: Optional[date]) -> pd.Dat
     except ModuleNotFoundError as exc:
         raise RuntimeError("Dependência ausente: instale `yfinance` para atualizar as cotações.") from exc
 
-    dl_start = (pd.Timestamp(last_dt) + pd.Timedelta(days=1)).strftime("%Y-%m-%d") if last_dt else start
+    today = pd.Timestamp.now().normalize()
+    if last_dt:
+        next_day = pd.Timestamp(last_dt).normalize() + pd.Timedelta(days=1)
+        if next_day > today:
+            return pd.DataFrame()
+        dl_start = next_day.strftime("%Y-%m-%d")
+    else:
+        start_ts = pd.Timestamp(start).normalize()
+        dl_start = min(start_ts, today).strftime("%Y-%m-%d")
     df = yf.download(ticker, start=dl_start, progress=False, auto_adjust=False)
     if df is None or df.empty:
         return pd.DataFrame()
@@ -260,6 +268,11 @@ def optionchain(subjacente: str) -> pd.DataFrame:
     if not expiries:
         return pd.DataFrame()
     frames = [optionchaindate(subjacente, expiry) for expiry in expiries]
+    frames = [frame for frame in frames if frame is not None and not frame.empty]
+    if not frames:
+        return pd.DataFrame(
+            columns=["subjacente", "vencimento", "ativo", "tipo", "modelo", "strike", "preco", "negocios", "volume"]
+        )
     return pd.concat(frames, ignore_index=True)
 
 
@@ -512,19 +525,82 @@ def _latest_spot_and_histvol(asset_id: int, trade_date: date) -> tuple[Optional[
         return None, None
     df = pd.read_parquet(path)
     df["trade_date"] = pd.to_datetime(df["trade_date"], errors="coerce").dt.date
-    row = df[(pd.to_numeric(df["asset_id"], errors="coerce") == int(asset_id)) & (df["trade_date"] == trade_date)].tail(1)
+    df = df[pd.to_numeric(df["asset_id"], errors="coerce") == int(asset_id)].copy()
+    row = df[df["trade_date"] == trade_date].tail(1)
     if row.empty:
         return None, None
-    item = row.iloc[0]
-    return item.get("close"), item.get("vol_annual")
+    spot = pd.to_numeric(row["close"], errors="coerce").dropna()
+    spot_val = None if spot.empty else float(spot.iloc[-1])
+
+    vol_today = pd.to_numeric(row["vol_annual"], errors="coerce").dropna()
+    if not vol_today.empty and float(vol_today.iloc[-1]) > 0:
+        return spot_val, float(vol_today.iloc[-1])
+
+    vol_hist = pd.to_numeric(df.loc[df["trade_date"] <= trade_date, "vol_annual"], errors="coerce").dropna()
+    vol_hist = vol_hist[vol_hist > 0]
+    vol_val = None if vol_hist.empty else float(vol_hist.iloc[-1])
+    return spot_val, vol_val
+
+
+def _load_daily_price_window(asset_id: int, end_dt: Optional[date], rows: int) -> pd.DataFrame:
+    path = table_path("daily_bars", BASE_DIR)
+    if not path.exists() or end_dt is None:
+        return pd.DataFrame()
+
+    cols = ["asset_id", "trade_date", "open", "high", "low", "close", "adj_close", "volume"]
+    df = pd.read_parquet(path)
+    if df.empty:
+        return pd.DataFrame()
+
+    for col in cols:
+        if col not in df.columns:
+            df[col] = np.nan
+
+    df["trade_date"] = pd.to_datetime(df["trade_date"], errors="coerce")
+    mask = (pd.to_numeric(df["asset_id"], errors="coerce") == int(asset_id)) & (df["trade_date"] <= pd.Timestamp(end_dt))
+    hist = df.loc[mask, cols].copy().sort_values("trade_date").tail(max(1, int(rows)))
+    if hist.empty:
+        return pd.DataFrame()
+
+    hist = hist.rename(
+        columns={
+            "open": "Open",
+            "high": "High",
+            "low": "Low",
+            "close": "Close",
+            "adj_close": "AdjClose",
+            "volume": "Volume",
+        }
+    )
+    hist["trade_date"] = pd.to_datetime(hist["trade_date"], errors="coerce")
+    hist = hist.set_index("trade_date")
+    keep = ["Open", "High", "Low", "Close", "AdjClose", "Volume"]
+    for col in keep:
+        hist[col] = pd.to_numeric(hist[col], errors="coerce")
+    return hist[keep].dropna(how="all")
 
 
 def update_underlying_history(cfg: CFG, ticker: str, asset_id: int) -> dict:
     last_dt = _last_daily_snapshot(asset_id)
     hist = fetch_yf_history(ticker, cfg.hist_start, last_dt)
     if hist.empty:
-        return {"ticker": ticker, "daily_rows": 0, "trade_date": None}
-    hist_ind = add_indicators_one(hist, cfg)
+        return {"ticker": ticker, "daily_rows": 0, "trade_date": last_dt}
+
+    lookback_rows = max(cfg.sma_slow, cfg.sharpe_win, cfg.atr_n, cfg.rsi_n, cfg.ema_slow, cfg.ema_fast, cfg.macd_sig) + 5
+    prior = _load_daily_price_window(asset_id, last_dt, lookback_rows)
+    if prior.empty:
+        calc_base = hist.copy()
+    else:
+        calc_base = pd.concat([prior, hist], axis=0)
+        calc_base = calc_base[~calc_base.index.duplicated(keep="last")].sort_index()
+
+    hist_ind = add_indicators_one(calc_base, cfg)
+    if last_dt is not None:
+        hist_ind = hist_ind[hist_ind.index > pd.Timestamp(last_dt)]
+
+    if hist_ind.empty:
+        return {"ticker": ticker, "daily_rows": 0, "trade_date": last_dt}
+
     daily_frame = build_daily_bars_frame(asset_id, hist_ind)
     upsert_parquet(
         table_path("daily_bars", BASE_DIR),
@@ -612,9 +688,16 @@ def run_market_update(
             item.update(update_underlying_history(cfg, ticker, asset_id))
 
         trade_date = item.get("trade_date")
+        if update_options and not trade_date:
+            trade_date = _last_daily_snapshot(asset_id)
+            if trade_date:
+                item["trade_date"] = trade_date
+
         if update_options and trade_date:
             item.update(update_option_chain(cfg, ticker, asset_id, trade_date))
             item.update(update_option_models(cfg, ticker, asset_id, trade_date))
+        elif update_options:
+            item.update({"option_rows": 0, "model_rows": 0})
 
         summary["tickers"].append(item)
 
