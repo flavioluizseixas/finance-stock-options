@@ -43,6 +43,26 @@ def _spot_from_df(df: pd.DataFrame) -> float:
                     return v
     return 1.0
 
+
+def _group_keys(df: pd.DataFrame) -> list[str]:
+    keys = []
+    for col in ["asset_id", "ticker", "trade_date", "expiry_date"]:
+        if col in df.columns:
+            keys.append(col)
+    return keys
+
+
+def _group_frames(df: pd.DataFrame):
+    keys = _group_keys(df)
+    if not keys:
+        yield {}, df.copy()
+        return
+    for group_key, frame in df.groupby(keys, dropna=False, sort=False):
+        if not isinstance(group_key, tuple):
+            group_key = (group_key,)
+        meta = dict(zip(keys, group_key))
+        yield meta, frame.copy()
+
 def _cand_buy_deep_itm_call(df: pd.DataFrame, expiry, cfg: dict, top_n: int) -> StrategyResult:
     d = df.copy()
     if expiry is not None:
@@ -205,22 +225,23 @@ def _cand_vertical_spreads(df: pd.DataFrame, expiry, kind: str, cfg: dict, top_n
         return StrategyResult(pd.DataFrame(), ["Sem opções elegíveis"], [])
 
     rows = []
-    if kind == "bull_call":
-        calls = d[d["option_type"].astype(str).str.upper() == "CALL"].copy()
-        buy = calls[calls.get("moneyness") == "ATM"].copy()
-        sell = calls[calls.get("moneyness") == "OTM"].copy()
-        for _, b in buy.iterrows():
-            cand = sell[sell["strike"] > b["strike"]].sort_values("strike").head(12)
-            for _, s in cand.iterrows():
-                debit = float(b["last_price"]) - float(s["last_price"])
-                if debit <= 0:
-                    continue
-                max_profit = (float(s["strike"]) - float(b["strike"])) - debit
-                if max_profit <= 0:
-                    continue
-                rr = max_profit / debit
-                rows.append(
-                    {
+    for meta, grp in _group_frames(d):
+        if kind == "bull_call":
+            calls = grp[grp["option_type"].astype(str).str.upper() == "CALL"].copy()
+            buy = calls[calls.get("moneyness") == "ATM"].copy()
+            sell = calls[calls.get("moneyness") == "OTM"].copy()
+            for _, b in buy.iterrows():
+                cand = sell[sell["strike"] > b["strike"]].sort_values("strike").head(12)
+                for _, s in cand.iterrows():
+                    debit = float(b["last_price"]) - float(s["last_price"])
+                    width = float(s["strike"]) - float(b["strike"])
+                    if debit <= 0 or width <= 0.05:
+                        continue
+                    max_profit = width - debit
+                    if max_profit <= 0:
+                        continue
+                    rr = max_profit / debit
+                    row = {
                         "strategy": "Bull Call Spread",
                         "buy": b["option_symbol"],
                         "sell": s["option_symbol"],
@@ -229,27 +250,29 @@ def _cand_vertical_spreads(df: pd.DataFrame, expiry, kind: str, cfg: dict, top_n
                         "P_buy": float(b["last_price"]),
                         "P_sell": float(s["last_price"]),
                         "debit": debit,
+                        "width": width,
                         "max_profit": max_profit,
                         "rr": rr,
                         "spot_ref": _spot_from_row(b),
                     }
-                )
-    else:
-        puts = d[d["option_type"].astype(str).str.upper() == "PUT"].copy()
-        buy = puts[puts.get("moneyness") == "ATM"].copy()
-        sell = puts[puts.get("moneyness") == "OTM"].copy()
-        for _, b in buy.iterrows():
-            cand = sell[sell["strike"] < b["strike"]].sort_values("strike", ascending=False).head(12)
-            for _, s in cand.iterrows():
-                debit = float(b["last_price"]) - float(s["last_price"])
-                if debit <= 0:
-                    continue
-                max_profit = (float(b["strike"]) - float(s["strike"])) - debit
-                if max_profit <= 0:
-                    continue
-                rr = max_profit / debit
-                rows.append(
-                    {
+                    row.update(meta)
+                    rows.append(row)
+        else:
+            puts = grp[grp["option_type"].astype(str).str.upper() == "PUT"].copy()
+            buy = puts[puts.get("moneyness") == "ATM"].copy()
+            sell = puts[puts.get("moneyness") == "OTM"].copy()
+            for _, b in buy.iterrows():
+                cand = sell[sell["strike"] < b["strike"]].sort_values("strike", ascending=False).head(12)
+                for _, s in cand.iterrows():
+                    debit = float(b["last_price"]) - float(s["last_price"])
+                    width = float(b["strike"]) - float(s["strike"])
+                    if debit <= 0 or width <= 0.05:
+                        continue
+                    max_profit = width - debit
+                    if max_profit <= 0:
+                        continue
+                    rr = max_profit / debit
+                    row = {
                         "strategy": "Bear Put Spread",
                         "buy": b["option_symbol"],
                         "sell": s["option_symbol"],
@@ -258,11 +281,13 @@ def _cand_vertical_spreads(df: pd.DataFrame, expiry, kind: str, cfg: dict, top_n
                         "P_buy": float(b["last_price"]),
                         "P_sell": float(s["last_price"]),
                         "debit": debit,
+                        "width": width,
                         "max_profit": max_profit,
                         "rr": rr,
                         "spot_ref": _spot_from_row(b),
                     }
-                )
+                    row.update(meta)
+                    rows.append(row)
 
     if not rows:
         return StrategyResult(pd.DataFrame(), ["Sem combinações válidas"], [])
@@ -332,80 +357,81 @@ def _cand_credit_spreads(df: pd.DataFrame, expiry, kind: str, cfg: dict, top_n: 
     put_sell_band  = tuple(cfg.get("credit_put_sell_band",  (-0.30, -0.15)))
     put_buy_band   = tuple(cfg.get("credit_put_buy_band",   (-0.15, -0.05)))
 
-    spot_ref = _spot_from_df(d)
     rows = []
-
-    if kind == "bear_call":
-        calls = d[d["option_type"].str.upper() == "CALL"].copy()
-        sells = calls[calls["delta"].between(*call_sell_band)].copy()
-        buys  = calls[calls["delta"].between(*call_buy_band)].copy()
-        if sells.empty or buys.empty:
-            return StrategyResult(pd.DataFrame())
-
-        sells = sells.sort_values(["liq", "trades", "volume"], ascending=[False, False, False]).head(20)
-
-        for _, s in sells.iterrows():
-            cand = buys[buys["strike"] > s["strike"]].sort_values("strike").head(30)
-            for _, b in cand.iterrows():
-                credit = float(s["last_price"]) - float(b["last_price"])
-                if credit <= 0:
-                    continue
-                width = float(b["strike"]) - float(s["strike"])
-                max_loss = width - credit
-                if max_loss <= 0:
-                    continue
-                cr = credit / max_loss
-                liq_pair = float(min(s["liq"], b["liq"]))
-                row = {
-                    "strategy": "Bear Call Credit Spread",
-                    "spot_ref": spot_ref,
-                "sell": s["option_symbol"], "buy": b["option_symbol"],
-                    "K_sell": float(s["strike"]), "K_buy": float(b["strike"]),
-                    "P_sell": float(s["last_price"]), "P_buy": float(b["last_price"]),
-                    "credit": credit, "max_loss_est": max_loss, "cr": cr,
-                    "liq_min": liq_pair,
-                }
-                if "ticker" in d.columns:
-                    row["ticker"] = s.get("ticker")
-                if "expiry_date" in d.columns:
-                    row["expiry_date"] = s.get("expiry_date")
-                rows.append(row)
-
-    else:  # bull_put
-        puts = d[d["option_type"].str.upper() == "PUT"].copy()
-        sells = puts[puts["delta"].between(*put_sell_band)].copy()
-        buys  = puts[puts["delta"].between(*put_buy_band)].copy()
-        if sells.empty or buys.empty:
-            return StrategyResult(pd.DataFrame())
-
-        sells = sells.sort_values(["liq", "trades", "volume"], ascending=[False, False, False]).head(20)
-
-        for _, s in sells.iterrows():
-            cand = buys[buys["strike"] < s["strike"]].sort_values("strike", ascending=False).head(30)
-            for _, b in cand.iterrows():
-                credit = float(s["last_price"]) - float(b["last_price"])
-                if credit <= 0:
-                    continue
-                width = float(s["strike"]) - float(b["strike"])
-                max_loss = width - credit
-                if max_loss <= 0:
-                    continue
-                cr = credit / max_loss
-                liq_pair = float(min(s["liq"], b["liq"]))
-                row = {
-                    "strategy": "Bull Put Credit Spread",
-                    "spot_ref": spot_ref,
-                "sell": s["option_symbol"], "buy": b["option_symbol"],
-                    "K_sell": float(s["strike"]), "K_buy": float(b["strike"]),
-                    "P_sell": float(s["last_price"]), "P_buy": float(b["last_price"]),
-                    "credit": credit, "max_loss_est": max_loss, "cr": cr,
-                    "liq_min": liq_pair,
-                }
-                if "ticker" in d.columns:
-                    row["ticker"] = s.get("ticker")
-                if "expiry_date" in d.columns:
-                    row["expiry_date"] = s.get("expiry_date")
-                rows.append(row)
+    for meta, grp in _group_frames(d):
+        spot_ref = _spot_from_df(grp)
+        if kind == "bear_call":
+            calls = grp[grp["option_type"].str.upper() == "CALL"].copy()
+            sells = calls[calls["delta"].between(*call_sell_band)].copy()
+            buys = calls[calls["delta"].between(*call_buy_band)].copy()
+            if sells.empty or buys.empty:
+                continue
+            sells = sells.sort_values(["liq", "trades", "volume"], ascending=[False, False, False]).head(20)
+            for _, s in sells.iterrows():
+                cand = buys[buys["strike"] > s["strike"]].sort_values("strike").head(30)
+                for _, b in cand.iterrows():
+                    credit = float(s["last_price"]) - float(b["last_price"])
+                    width = float(b["strike"]) - float(s["strike"])
+                    if credit <= 0 or width <= 0.05:
+                        continue
+                    max_loss = width - credit
+                    if max_loss <= 0.05:
+                        continue
+                    cr = min(credit / max_loss, float(cfg.get("credit_spread_cr_cap", 20.0)))
+                    liq_pair = float(min(s["liq"], b["liq"]))
+                    row = {
+                        "strategy": "Bear Call Credit Spread",
+                        "spot_ref": spot_ref,
+                        "sell": s["option_symbol"],
+                        "buy": b["option_symbol"],
+                        "K_sell": float(s["strike"]),
+                        "K_buy": float(b["strike"]),
+                        "P_sell": float(s["last_price"]),
+                        "P_buy": float(b["last_price"]),
+                        "credit": credit,
+                        "width": width,
+                        "max_loss_est": max_loss,
+                        "cr": cr,
+                        "liq_min": liq_pair,
+                    }
+                    row.update(meta)
+                    rows.append(row)
+        else:
+            puts = grp[grp["option_type"].str.upper() == "PUT"].copy()
+            sells = puts[puts["delta"].between(*put_sell_band)].copy()
+            buys = puts[puts["delta"].between(*put_buy_band)].copy()
+            if sells.empty or buys.empty:
+                continue
+            sells = sells.sort_values(["liq", "trades", "volume"], ascending=[False, False, False]).head(20)
+            for _, s in sells.iterrows():
+                cand = buys[buys["strike"] < s["strike"]].sort_values("strike", ascending=False).head(30)
+                for _, b in cand.iterrows():
+                    credit = float(s["last_price"]) - float(b["last_price"])
+                    width = float(s["strike"]) - float(b["strike"])
+                    if credit <= 0 or width <= 0.05:
+                        continue
+                    max_loss = width - credit
+                    if max_loss <= 0.05:
+                        continue
+                    cr = min(credit / max_loss, float(cfg.get("credit_spread_cr_cap", 20.0)))
+                    liq_pair = float(min(s["liq"], b["liq"]))
+                    row = {
+                        "strategy": "Bull Put Credit Spread",
+                        "spot_ref": spot_ref,
+                        "sell": s["option_symbol"],
+                        "buy": b["option_symbol"],
+                        "K_sell": float(s["strike"]),
+                        "K_buy": float(b["strike"]),
+                        "P_sell": float(s["last_price"]),
+                        "P_buy": float(b["last_price"]),
+                        "credit": credit,
+                        "width": width,
+                        "max_loss_est": max_loss,
+                        "cr": cr,
+                        "liq_min": liq_pair,
+                    }
+                    row.update(meta)
+                    rows.append(row)
 
     if not rows:
         return StrategyResult(pd.DataFrame())
@@ -466,17 +492,21 @@ def _cand_long_straddle(df: pd.DataFrame, expiry, cfg: dict, top_n: int) -> Stra
         return StrategyResult(pd.DataFrame(), ["Sem CALL/PUT ATM"], [])
 
     rows = []
-    for _, c in calls.iterrows():
-        ptmp = puts.copy()
-        ptmp["dK"] = (ptmp["strike"] - c["strike"]).abs()
-        p = ptmp.sort_values(["dK", "trades", "volume"], ascending=[True, False, False]).head(1)
-        if p.empty:
+    for meta, grp in _group_frames(d):
+        calls_g = grp[(grp["option_type"].astype(str).str.upper() == "CALL") & (grp.get("moneyness") == "ATM")].copy()
+        puts_g = grp[(grp["option_type"].astype(str).str.upper() == "PUT") & (grp.get("moneyness") == "ATM")].copy()
+        if calls_g.empty or puts_g.empty:
             continue
-        p = p.iloc[0]
-        prem = float(c["last_price"]) + float(p["last_price"])
-        liq = float(_liq(pd.DataFrame([c])).iloc[0]) + float(_liq(pd.DataFrame([p])).iloc[0])
-        rows.append(
-            {
+        for _, c in calls_g.iterrows():
+            ptmp = puts_g.copy()
+            ptmp["dK"] = (ptmp["strike"] - c["strike"]).abs()
+            p = ptmp.sort_values(["dK", "trades", "volume"], ascending=[True, False, False]).head(1)
+            if p.empty:
+                continue
+            p = p.iloc[0]
+            prem = float(c["last_price"]) + float(p["last_price"])
+            liq = float(_liq(pd.DataFrame([c])).iloc[0]) + float(_liq(pd.DataFrame([p])).iloc[0])
+            row = {
                 "strategy": "Long Straddle (ATM)",
                 "call": c["option_symbol"],
                 "put": p["option_symbol"],
@@ -488,7 +518,8 @@ def _cand_long_straddle(df: pd.DataFrame, expiry, cfg: dict, top_n: int) -> Stra
                 "liq": liq,
                 "spot_ref": _spot_from_row(c),
             }
-        )
+            row.update(meta)
+            rows.append(row)
 
     if not rows:
         return StrategyResult(pd.DataFrame(), ["Sem pares válidos"], [])
@@ -540,79 +571,68 @@ def _condor_candidates(df: pd.DataFrame, expiry, opt_type: str, cfg: dict, top_n
     if d.empty:
         return pd.DataFrame()
 
-    regime = str(d.get("regime", "Neutra").iloc[0]) if len(d) else "Neutra"
-    if opt_type == "CALL":
-        sell_band = cfg.get("condor_call_sell_band", (0.18, 0.32))
-        buy_band = cfg.get("condor_call_buy_band", (0.06, 0.16))
-        if regime == "Alta":
-            sell_band = cfg.get("condor_call_sell_band_up", (0.12, 0.22))
-            buy_band = cfg.get("condor_call_buy_band_up", (0.04, 0.10))
-    else:
-        sell_band = cfg.get("condor_put_sell_band", (-0.32, -0.18))
-        buy_band = cfg.get("condor_put_buy_band", (-0.16, -0.06))
-        if regime == "Baixa":
-            sell_band = cfg.get("condor_put_sell_band_down", (-0.22, -0.12))
-            buy_band = cfg.get("condor_put_buy_band_down", (-0.10, -0.04))
-
-    sell_band = (float(sell_band[0]), float(sell_band[1]))
-    buy_band = (float(buy_band[0]), float(buy_band[1]))
-
-    sells = d[d["delta"].between(*sell_band)].copy()
-    buys = d[d["delta"].between(*buy_band)].copy()
-    if sells.empty or buys.empty:
-        return pd.DataFrame()
-
-    sells = sells.sort_values("strike").head(12)
-    spot_ref = _spot_from_df(d)
     rows = []
-    for i in range(min(len(sells), 8)):
-        for j in range(i + 1, min(len(sells), 10)):
-            s1 = sells.iloc[i]
-            s4 = sells.iloc[j]
-            K1, K4 = float(s1["strike"]), float(s4["strike"])
-            if K4 <= K1:
-                continue
+    for meta, grp in _group_frames(d):
+        regime = str(grp.get("regime", "Neutra").iloc[0]) if len(grp) else "Neutra"
+        if opt_type == "CALL":
+            sell_band = cfg.get("condor_call_sell_band", (0.18, 0.32))
+            buy_band = cfg.get("condor_call_buy_band", (0.06, 0.16))
+            if regime == "Alta":
+                sell_band = cfg.get("condor_call_sell_band_up", (0.12, 0.22))
+                buy_band = cfg.get("condor_call_buy_band_up", (0.04, 0.10))
+        else:
+            sell_band = cfg.get("condor_put_sell_band", (-0.32, -0.18))
+            buy_band = cfg.get("condor_put_buy_band", (-0.16, -0.06))
+            if regime == "Baixa":
+                sell_band = cfg.get("condor_put_sell_band_down", (-0.22, -0.12))
+                buy_band = cfg.get("condor_put_buy_band_down", (-0.10, -0.04))
 
-            b_in = buys[(buys["strike"] > K1) & (buys["strike"] < K4)].copy()
-            if b_in.empty:
-                continue
-
-            gap = max((K4 - K1) / 3.0, 0.01)
-            target_k2 = K1 + gap
-            target_k3 = K4 - gap
-
-            avoid = {s1["option_symbol"], s4["option_symbol"]}
-            b2 = _pick_nearest_strike_row(b_in, target_k2, avoid)
-            if b2 is None:
-                continue
-            avoid.add(b2["option_symbol"])
-            b3 = _pick_nearest_strike_row(b_in, target_k3, avoid)
-            if b3 is None:
-                continue
-
-            K2, K3 = float(b2["strike"]), float(b3["strike"])
-            if not (K1 < K2 < K3 < K4):
-                continue
-
-            P_s1 = float(s1["last_price"])
-            P_s4 = float(s4["last_price"])
-            P_b2 = float(b2["last_price"])
-            P_b3 = float(b3["last_price"])
-
-            credit = (P_s1 + P_s4) - (P_b2 + P_b3)
-            if credit <= 0:
-                continue
-
-            w_left = (K2 - K1)
-            w_right = (K4 - K3)
-            max_loss_est = max(w_left, w_right) - credit
-            if max_loss_est <= 0:
-                continue
-
-            cr = credit / max_loss_est
-            liq_sum = float(_liq(pd.DataFrame([s1])).iloc[0]) + float(_liq(pd.DataFrame([b2])).iloc[0]) + float(_liq(pd.DataFrame([b3])).iloc[0]) + float(_liq(pd.DataFrame([s4])).iloc[0])
-            rows.append(
-                {
+        sell_band = (float(sell_band[0]), float(sell_band[1]))
+        buy_band = (float(buy_band[0]), float(buy_band[1]))
+        sells = grp[grp["delta"].between(*sell_band)].copy()
+        buys = grp[grp["delta"].between(*buy_band)].copy()
+        if sells.empty or buys.empty:
+            continue
+        sells = sells.sort_values("strike").head(12)
+        for i in range(min(len(sells), 8)):
+            for j in range(i + 1, min(len(sells), 10)):
+                s1 = sells.iloc[i]
+                s4 = sells.iloc[j]
+                K1, K4 = float(s1["strike"]), float(s4["strike"])
+                if K4 <= K1:
+                    continue
+                b_in = buys[(buys["strike"] > K1) & (buys["strike"] < K4)].copy()
+                if b_in.empty:
+                    continue
+                gap = max((K4 - K1) / 3.0, 0.01)
+                target_k2 = K1 + gap
+                target_k3 = K4 - gap
+                avoid = {s1["option_symbol"], s4["option_symbol"]}
+                b2 = _pick_nearest_strike_row(b_in, target_k2, avoid)
+                if b2 is None:
+                    continue
+                avoid.add(b2["option_symbol"])
+                b3 = _pick_nearest_strike_row(b_in, target_k3, avoid)
+                if b3 is None:
+                    continue
+                K2, K3 = float(b2["strike"]), float(b3["strike"])
+                if not (K1 < K2 < K3 < K4):
+                    continue
+                P_s1 = float(s1["last_price"])
+                P_s4 = float(s4["last_price"])
+                P_b2 = float(b2["last_price"])
+                P_b3 = float(b3["last_price"])
+                credit = (P_s1 + P_s4) - (P_b2 + P_b3)
+                if credit <= 0:
+                    continue
+                w_left = K2 - K1
+                w_right = K4 - K3
+                max_loss_est = max(w_left, w_right) - credit
+                if max_loss_est <= 0.05:
+                    continue
+                cr = min(credit / max_loss_est, float(cfg.get("credit_spread_cr_cap", 20.0)))
+                liq_sum = float(_liq(pd.DataFrame([s1])).iloc[0]) + float(_liq(pd.DataFrame([b2])).iloc[0]) + float(_liq(pd.DataFrame([b3])).iloc[0]) + float(_liq(pd.DataFrame([s4])).iloc[0])
+                row = {
                     "strategy": f"Short {opt_type} Condor (Credit)",
                     "sell_1": s1["option_symbol"],
                     "buy_2": b2["option_symbol"],
@@ -632,7 +652,8 @@ def _condor_candidates(df: pd.DataFrame, expiry, opt_type: str, cfg: dict, top_n
                     "liq": liq_sum,
                     "spot_ref": _spot_from_row(s1),
                 }
-            )
+                row.update(meta)
+                rows.append(row)
 
     if not rows:
         return pd.DataFrame()
@@ -706,19 +727,23 @@ def _cand_vol_trap_call_ratio(df: pd.DataFrame, expiry, cfg: dict, top_n: int) -
     sell = sell.sort_values(["moneyness_dist", "trades", "volume"], ascending=[False, False, False]).head(20)
 
     rows = []
-    for _, b in buy.iterrows():
-        # escolha short strike maior (mais OTM) do que o strike do ATM
-        s_cand = sell[sell["strike"] > b["strike"]].sort_values("strike")
-        for _, s in s_cand.head(12).iterrows():
-            credit = (n * float(s["last_price"])) - float(b["last_price"])
-            if credit <= 0:
-                continue
-            tail_k = float(s["strike"])
-            liq_sum = float(_liq(pd.DataFrame([b])).iloc[0]) + float(_liq(pd.DataFrame([s])).iloc[0])
-            # score: mais crédito e mais liquidez; penaliza short menos OTM
-            score = credit * 10.0 + liq_sum + float(s.get("moneyness_dist", 0.0)) * 100.0
-            rows.append(
-                {
+    for meta, grp in _group_frames(d):
+        buy_g = grp[grp.get("moneyness") == "ATM"].copy()
+        sell_g = grp[(grp.get("moneyness") == "OTM") & (grp["moneyness_dist"] >= min_dist) & (grp["delta"] <= dmax)].copy()
+        if buy_g.empty or sell_g.empty:
+            continue
+        buy_g = buy_g.sort_values(["trades", "volume"], ascending=[False, False]).head(10)
+        sell_g = sell_g.sort_values(["moneyness_dist", "trades", "volume"], ascending=[False, False, False]).head(20)
+        for _, b in buy_g.iterrows():
+            s_cand = sell_g[sell_g["strike"] > b["strike"]].sort_values("strike")
+            for _, s in s_cand.head(12).iterrows():
+                credit = (n * float(s["last_price"])) - float(b["last_price"])
+                if credit <= 0:
+                    continue
+                tail_k = float(s["strike"])
+                liq_sum = float(_liq(pd.DataFrame([b])).iloc[0]) + float(_liq(pd.DataFrame([s])).iloc[0])
+                score = credit * 10.0 + liq_sum + float(s.get("moneyness_dist", 0.0)) * 100.0
+                row = {
                     "strategy": f"Call Ratio (1x{n}) – crédito",
                     "buy": b["option_symbol"],
                     "sell": s["option_symbol"],
@@ -733,7 +758,8 @@ def _cand_vol_trap_call_ratio(df: pd.DataFrame, expiry, cfg: dict, top_n: int) -
                     "score": score,
                     "spot_ref": _spot_from_row(b),
                 }
-            )
+                row.update(meta)
+                rows.append(row)
 
     if not rows:
         return StrategyResult(pd.DataFrame(), ["Sem combinações a crédito"], ["Atenção: risco explode acima do strike vendido."])

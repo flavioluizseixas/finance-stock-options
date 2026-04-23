@@ -1,5 +1,7 @@
 import os
 
+from parquet_store import env_paths as parquet_env_paths
+
 DEFAULT_TOP_N = int(os.getenv("DEFAULT_TOP_N", "3"))
 
 DEFAULT_CFG = {
@@ -27,11 +29,4 @@ DEFAULT_CFG = {
 }
 
 def env_paths(base_dir: str):
-    data_dir = os.getenv("DATA_DIR", os.path.join(base_dir, "data"))
-    return {
-        "DATA_DIR": data_dir,
-        "PATH_ASSETS": os.getenv("PATH_ASSETS", os.path.join(data_dir, "assets.parquet")),
-        "PATH_DAILY":  os.getenv("PATH_DAILY",  os.path.join(data_dir, "daily_bars.parquet")),
-        "PATH_QUOTE":  os.getenv("PATH_QUOTE",  os.path.join(data_dir, "option_quote.parquet")),
-        "PATH_MODEL":  os.getenv("PATH_MODEL",  os.path.join(data_dir, "option_model.parquet")),
-    }
+    return parquet_env_paths(base_dir)

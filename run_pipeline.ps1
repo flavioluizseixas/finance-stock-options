@@ -5,8 +5,7 @@ $STREAMLIT = "C:\Users\Flavio\anaconda3\envs\myenv\Scripts\streamlit.exe"
 
 $SCRIPTS = @(
     "finance_options_pipeline.py",
-    "export_ms7_incremental.py",
-    "export_to_parquet.py"
+    "export_ms7_incremental.py"
 )
 
 foreach ($script in $SCRIPTS) {

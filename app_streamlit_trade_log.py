@@ -1,940 +1,599 @@
-# app_trade_log.py
-# ------------------------------------------------------------
-# Log de Operações de Opções (trade + legs) com:
-# - Entrada por LEG (ordem obrigatória):
-#   1) Underlying -> 2) Expiry (com negócios) -> 3) Tipo -> 4) Opção (com negócios, default ATM)
-#   5) last_price + ajuste entry_price -> 6) data operação -> 7) Incluir LEG (editor)
-# - Quantidade em AÇÕES (100 em 100), default 100 => contracts = qty/100
-#
-# Histórico:
-# - ver/editar cabeçalho, editar LEG (qty/entry/exit), remover operação
-# - P&L por trade (entry/exit, BUY/SELL) + fees
-# - "Fechar operação automaticamente": pede exit_price por leg, grava exit_dt e seta status=CLOSED
-# - "Duplicar operação": clona trade+legs (sem exit), cria novo trade OPEN com trade_date=hoje
-#
-# NOVO (pedido):
-# - direction calculado automaticamente (DEBIT/CREDIT) a partir dos LEGS (cashflow de entrada)
-# - P&L exibido também:
-#   - Total (R$)
-#   - "por 100 ações" (por 1 unidade de estratégia = 1 contrato-base)
-#   - "% do spot" (normalizado pelo spot * 100 ações * contrato-base)
-#
-# Dependências:
-#   pip install streamlit pymysql python-dotenv
-#
-# .env (exemplo):
-#   DB_HOST=localhost
-#   DB_PORT=3306
-#   DB_USER=root
-#   DB_PASSWORD=******
-#   DB_NAME=finance_options
-#
-# Exec:
-#   streamlit run app_trade_log.py
-
 import os
-from datetime import date, datetime
-from typing import Dict, Any, List, Optional, Tuple
+from datetime import date
 
+import numpy as np
+import pandas as pd
 import streamlit as st
-import pymysql
-from dotenv import load_dotenv
 
-load_dotenv()
+from parquet_store import env_paths, read_parquet_safe, table_path, upsert_parquet, utcnow_ts, write_parquet
 
 
-# ---------------- DB helpers ----------------
-def get_conn():
-    return pymysql.connect(
-        host=os.getenv("DB_HOST", "localhost"),
-        user=os.getenv("DB_USER", "root"),
-        password=os.getenv("DB_PASSWORD", ""),
-        database=os.getenv("DB_NAME", "finance_options"),
-        port=int(os.getenv("DB_PORT", "3306")),
-        autocommit=True,
-        cursorclass=pymysql.cursors.DictCursor,
-    )
+st.set_page_config(page_title="Trade Log Estruturado", layout="wide")
 
-def q_all(sql: str, params: tuple = ()) -> List[Dict[str, Any]]:
-    conn = get_conn()
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PATHS = env_paths(BASE_DIR)
+TRADES_PATH = table_path("structured_trades", BASE_DIR)
+LEGS_PATH = table_path("structured_trade_legs", BASE_DIR)
+ASSETS_PATH = table_path("assets", BASE_DIR)
+QUOTE_PATH = table_path("option_quote", BASE_DIR)
+DAILY_PATH = table_path("daily_bars", BASE_DIR)
+
+
+def _normalize_id_scalar(value):
+    if pd.isna(value):
+        return np.nan
+    if isinstance(value, pd.Timestamp):
+        return int(value.value)
+    if isinstance(value, np.datetime64):
+        return int(pd.Timestamp(value).value)
     try:
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            return cur.fetchall()
-    finally:
-        conn.close()
-
-def q_one(sql: str, params: tuple = ()) -> Optional[Dict[str, Any]]:
-    rows = q_all(sql, params)
-    return rows[0] if rows else None
+        return int(float(value))
+    except Exception:
+        return np.nan
 
 
-# ---------------- Finance logic ----------------
-def direction_from_legs(legs: List[Dict[str, Any]], multiplier: int = 100) -> str:
-    """
-    direction pela ENTRADA (cashflow):
-      SELL => entrada de prêmio (positivo)
-      BUY  => saída de prêmio (negativo)
-    net_cash = sum( sign * entry_price * contracts * multiplier )
-      sign = +1 para SELL, -1 para BUY
-    Se net_cash > 0 => CREDIT, senão => DEBIT (inclui 0)
-    """
+def _normalize_id_series(series: pd.Series) -> pd.Series:
+    return series.map(_normalize_id_scalar)
+
+
+def load_assets() -> pd.DataFrame:
+    df = read_parquet_safe(ASSETS_PATH)
+    if df.empty:
+        return pd.DataFrame(columns=["id", "ticker"])
+    if "id" in df.columns:
+        df["id"] = _normalize_id_series(df["id"])
+    if "is_active" in df.columns:
+        df = df[pd.to_numeric(df["is_active"], errors="coerce").fillna(1).astype(int) == 1]
+    return df[["id", "ticker"]].sort_values("ticker").reset_index(drop=True)
+
+
+def load_quotes(asset_id: int) -> pd.DataFrame:
+    df = read_parquet_safe(QUOTE_PATH)
+    if df.empty:
+        return df
+    if "asset_id" in df.columns:
+        df["asset_id"] = _normalize_id_series(df["asset_id"])
+    df["trade_date"] = pd.to_datetime(df["trade_date"], errors="coerce").dt.date
+    df["expiry_date"] = pd.to_datetime(df["expiry_date"], errors="coerce").dt.date
+    for col in ["strike", "last_price", "trades", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df[(df["asset_id"] == int(asset_id)) & (df["trades"] > 0) & (df["last_price"] > 0)].copy()
+
+
+def latest_spot(asset_id: int):
+    df = read_parquet_safe(DAILY_PATH)
+    if df.empty:
+        return None, None
+    if "asset_id" in df.columns:
+        df["asset_id"] = _normalize_id_series(df["asset_id"])
+    df["trade_date"] = pd.to_datetime(df["trade_date"], errors="coerce").dt.date
+    df = df[df["asset_id"] == int(asset_id)].sort_values("trade_date")
+    if df.empty:
+        return None, None
+    row = df.iloc[-1]
+    return row.get("trade_date"), row.get("close")
+
+
+def load_trade_tables():
+    trades = read_parquet_safe(TRADES_PATH)
+    legs = read_parquet_safe(LEGS_PATH)
+    if not trades.empty:
+        for col in ["trade_id", "asset_id", "quantity_multiplier"]:
+            if col in trades.columns:
+                trades[col] = _normalize_id_series(trades[col])
+        for col in ["trade_date", "asof_trade_date", "closed_date", "created_at", "updated_at"]:
+            if col in trades.columns:
+                trades[col] = pd.to_datetime(trades[col], errors="coerce")
+    if not legs.empty:
+        for col in ["leg_id", "trade_id", "leg_no", "contracts"]:
+            if col in legs.columns:
+                legs[col] = _normalize_id_series(legs[col])
+        for col in ["expiry", "created_at", "updated_at"]:
+            if col in legs.columns:
+                legs[col] = pd.to_datetime(legs[col], errors="coerce")
+        for col in ["strike", "entry_price", "exit_price", "ref_last_price"]:
+            if col in legs.columns:
+                legs[col] = pd.to_numeric(legs[col], errors="coerce")
+    return trades, legs
+
+
+def next_id(df: pd.DataFrame, col: str) -> int:
+    if df.empty or col not in df.columns:
+        return 1
+    val = _normalize_id_series(df[col]).max()
+    return 1 if pd.isna(val) else int(val) + 1
+
+
+def infer_defaults(quotes: pd.DataFrame, spot: float | None, opt_type: str):
+    if quotes.empty:
+        return None, pd.DataFrame(), None
+    today = pd.Timestamp.today().date()
+    quotes = quotes.copy()
+    quotes["strike_dist"] = (pd.to_numeric(quotes["strike"], errors="coerce") - float(spot or 0.0)).abs()
+    expiries = sorted([d for d in quotes["expiry_date"].dropna().unique().tolist() if d >= today] or quotes["expiry_date"].dropna().unique().tolist())
+    default_expiry = expiries[0] if expiries else None
+    subset = quotes[(quotes["expiry_date"] == default_expiry) & (quotes["option_type"] == opt_type)].copy()
+    if subset.empty:
+        return default_expiry, subset, None
+    subset = subset.sort_values(["strike_dist", "trades", "volume"], ascending=[True, False, False])
+    default_symbol = subset.iloc[0]["option_symbol"]
+    return default_expiry, subset, default_symbol
+
+
+def direction_from_legs(legs: list[dict], multiplier: int = 100) -> str:
     net_cash = 0.0
-    for l in legs:
-        side = (l.get("side") or "").upper()
-        entry = float(l.get("entry_price") or 0.0)
-        c = int(l.get("contracts") or 0)
+    for leg in legs:
+        side = str(leg.get("side", "")).upper()
         sign = 1.0 if side == "SELL" else -1.0
-        net_cash += sign * entry * c * multiplier
+        net_cash += sign * float(leg.get("entry_price", 0.0)) * float(leg.get("contracts", 0)) * multiplier
     return "CREDIT" if net_cash > 0 else "DEBIT"
 
-def recompute_and_update_direction(trade_id: int) -> None:
-    """
-    Recalcula direction com base nos legs atuais e atualiza option_trades.direction.
-    """
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT quantity_multiplier FROM option_trades WHERE id=%s", (trade_id,))
-            row = cur.fetchone()
-            mult = int(row["quantity_multiplier"] or 100) if row else 100
 
-            cur.execute("SELECT side, entry_price, contracts FROM option_trade_legs WHERE trade_id=%s", (trade_id,))
-            legs = cur.fetchall()
-
-            new_dir = direction_from_legs(legs, multiplier=mult)
-            cur.execute("UPDATE option_trades SET direction=%s WHERE id=%s", (new_dir, trade_id))
-    finally:
-        conn.close()
-
-def calc_leg_pnl(leg: Dict[str, Any], multiplier: int = 100) -> Optional[float]:
-    """
-    P&L do leg baseado em entry/exit.
-       BUY:  (exit - entry) * contracts * multiplier
-       SELL: (entry - exit) * contracts * multiplier
-       Se exit_price for NULL -> None
-    """
-    entry = leg.get("entry_price")
-    exitp = leg.get("exit_price")
-    if entry is None or exitp is None:
+def calc_leg_pnl(leg: pd.Series, multiplier: int) -> float | None:
+    if pd.isna(leg.get("exit_price")):
         return None
-    entry = float(entry)
-    exitp = float(exitp)
-    c = int(leg.get("contracts") or 0)
-    side = (leg.get("side") or "").upper()
-    if c <= 0:
-        return 0.0
-    if side == "BUY":
-        return (exitp - entry) * c * multiplier
-    if side == "SELL":
-        return (entry - exitp) * c * multiplier
-    return None
-
-def calc_trade_pnl_total(legs: List[Dict[str, Any]], fees: float = 0.0, multiplier: int = 100) -> Tuple[Optional[float], float, bool]:
-    """
-    Retorna:
-      - pnl_if_closed: soma legs - fees, somente se TODOS legs tiverem exit_price
-      - pnl_partial: soma apenas legs com exit_price - fees
-      - is_fully_closed: True se todos legs tiverem exit_price
-    """
-    fees = float(fees or 0.0)
-    pnls = [calc_leg_pnl(l, multiplier=multiplier) for l in legs]
-    partial_sum = sum([p for p in pnls if p is not None]) - fees
-    fully_closed = all(p is not None for p in pnls) and len(legs) > 0
-    closed_sum = (sum(pnls) - fees) if fully_closed else None
-    return closed_sum, partial_sum, fully_closed
-
-def contract_base(legs: List[Dict[str, Any]]) -> int:
-    """
-    Define uma 'unidade de estratégia' em contratos para normalização.
-    Regra prática: usa o mínimo de contracts entre os legs (>0).
-    (Em spreads/condors normalmente é igual; se não for, ainda dá uma unidade consistente.)
-    """
-    cs = [int(l.get("contracts") or 0) for l in legs if int(l.get("contracts") or 0) > 0]
-    return min(cs) if cs else 1
-
-def pnl_per_100(pnl_total: float, legs: List[Dict[str, Any]]) -> float:
-    """
-    Normaliza P&L para 'por 100 ações' = por 1 unidade de estratégia (contract_base).
-    """
-    base = contract_base(legs)
-    return pnl_total / float(base)
-
-def pnl_pct_spot(pnl_total: float, legs: List[Dict[str, Any]], spot: Optional[float], multiplier: int = 100) -> Optional[float]:
-    """
-    Normaliza P&L como % do notional: spot * multiplier * contract_base
-    """
-    if spot is None or spot <= 0:
-        return None
-    base = contract_base(legs)
-    denom = float(spot) * float(multiplier) * float(base)
-    if denom == 0:
-        return None
-    return (pnl_total / denom) * 100.0
+    entry = float(leg.get("entry_price", 0.0))
+    exit_price = float(leg.get("exit_price", 0.0))
+    contracts = float(leg.get("contracts", 0))
+    if str(leg.get("side", "")).upper() == "SELL":
+        return (entry - exit_price) * contracts * multiplier
+    return (exit_price - entry) * contracts * multiplier
 
 
-# ---------------- UI helpers ----------------
-def fmt_opt(r: Dict[str, Any]) -> str:
-    lp = r["last_price"]
-    return (
-        f'{r["option_symbol"]} | K={float(r["strike"]):.2f} | '
-        f'last={lp if lp is not None else "NA"} | '
-        f'vol={int(r["volume"] or 0)} | trd={int(r["trades"] or 0)}'
-    )
+def save_trade(header: dict, legs_payload: list[dict]):
+    trades, legs = load_trade_tables()
+    trade_id = next_id(trades, "trade_id")
+    now = utcnow_ts()
+    multiplier = int(header.get("quantity_multiplier", 100))
+    direction = direction_from_legs(legs_payload, multiplier)
 
-def pick_atm_index(quotes: List[Dict[str, Any]], spot: Optional[float]) -> Optional[int]:
-    """Escolhe a opção mais ATM (menor |K-spot|), dentre opções com negócios.
-       Desempate: mais trades, depois mais volume.
-    """
-    if not quotes:
-        return None
-    if spot is None:
-        return 0
-
-    scored: List[Tuple[float, int, int, int]] = []
-    for i, r in enumerate(quotes):
-        k = float(r["strike"])
-        dist = abs(k - float(spot))
-        tr = int(r["trades"] or 0)
-        vol = int(r["volume"] or 0)
-        scored.append((dist, -tr, -vol, i))
-    scored.sort()
-    return scored[0][-1]
-
-
-# ---------------- Page ----------------
-st.set_page_config(page_title="Option Trade Log", layout="wide")
-st.title("Log de Operações com Opções")
-
-if "legs" not in st.session_state:
-    st.session_state.legs = []
-
-# ---------------- (1) Underlying ----------------
-assets = q_all("""
-SELECT id AS asset_id, ticker
-FROM assets
-WHERE is_active = 1
-ORDER BY ticker
-""")
-
-if not assets:
-    st.error("Nenhum ativo encontrado em assets(is_active=1).")
-    st.stop()
-
-asset_map = {a["ticker"]: a["asset_id"] for a in assets}
-ticker = st.selectbox("1) Underlying", options=list(asset_map.keys()), index=0)
-asset_id = asset_map[ticker]
-
-# as-of trade date (último pregão coletado para opções)
-asof_row = q_one("SELECT MAX(trade_date) AS asof_trade_date FROM option_quote WHERE asset_id=%s", (asset_id,))
-asof_trade_date = asof_row["asof_trade_date"] if asof_row else None
-
-colA, colB, colC = st.columns([1, 1, 1])
-with colA:
-    st.caption("Pregão de referência (última data com option_quote)")
-    st.write(asof_trade_date)
-
-# spot no pregão de referência
-spot = None
-with colB:
-    spot_row = None
-    if asof_trade_date is not None:
-        spot_row = q_one(
-            "SELECT close FROM daily_bars WHERE asset_id=%s AND trade_date=%s",
-            (asset_id, asof_trade_date),
-        )
-    spot = float(spot_row["close"]) if spot_row and spot_row["close"] is not None else None
-    st.caption("Spot (close) no pregão de referência")
-    st.write(spot)
-
-with colC:
-    st.caption("Legs no editor")
-    st.write(len(st.session_state.legs))
-
-if asof_trade_date is None:
-    st.warning("Não há option_quote coletado para este ativo ainda.")
-    st.stop()
-
-st.divider()
-
-# ---------------- Leg builder ----------------
-st.subheader("Montar um LEG (ordem obrigatória)")
-
-# (2) Expiry filtrado por negócios (SUM(trades) > 0)
-expiries = q_all("""
-SELECT q.expiry_date
-FROM option_quote q
-WHERE q.asset_id=%s
-  AND q.trade_date=%s
-GROUP BY q.expiry_date
-HAVING COALESCE(SUM(q.trades), 0) > 0
-ORDER BY q.expiry_date
-""", (asset_id, asof_trade_date))
-
-expiry_options = [r["expiry_date"] for r in expiries]
-if not expiry_options:
-    st.warning("Não há vencimentos com negócios (trades) neste pregão de referência.")
-    st.stop()
-
-expiry = st.selectbox("2) Expiry (somente com negócios)", options=expiry_options, index=0)
-
-# (3) Tipo
-opt_type = st.selectbox("3) Tipo", options=["CALL", "PUT"], index=0)
-
-# (4) Opções do tipo+vencimento, somente com negócios (trades > 0)
-quotes = q_all("""
-SELECT option_symbol, strike, last_price, volume, trades, collected_at
-FROM option_quote
-WHERE asset_id=%s
-  AND trade_date=%s
-  AND expiry_date=%s
-  AND option_type=%s
-  AND COALESCE(trades, 0) > 0
-ORDER BY strike
-""", (asset_id, asof_trade_date, expiry, opt_type))
-
-if not quotes:
-    st.warning("Não há opções com negócios para este tipo/vencimento no pregão de referência.")
-    st.stop()
-
-opt_labels = [fmt_opt(r) for r in quotes]
-atm_idx = pick_atm_index(quotes, spot)
-
-opt_idx = st.selectbox(
-    "4) Opção (somente com negócios) — default: mais próxima de ATM",
-    options=list(range(len(opt_labels))),
-    format_func=lambda i: opt_labels[i],
-    index=atm_idx if atm_idx is not None else 0
-)
-selected = quotes[opt_idx]
-
-# (5) prêmio e ajustes + qty
-col1, col2, col3, col4, col5 = st.columns([1, 1, 1, 1, 1])
-
-with col1:
-    side = st.selectbox("Side", options=["BUY", "SELL"], index=0)
-
-with col2:
-    qty_shares = st.number_input(
-        "Quantidade (ações) — múltiplos de 100",
-        min_value=100,
-        step=100,
-        value=100,
-    )
-    contracts = int(qty_shares // 100)
-    st.caption("Contratos (qty/100)")
-    st.write(contracts)
-
-with col3:
-    last_price = selected["last_price"]
-    st.caption("last_price (referência)")
-    st.write(last_price)
-
-with col4:
-    default_entry = float(last_price) if last_price is not None else 0.0
-    entry_price = st.number_input(
-        "entry_price (efetivado)",
-        min_value=0.0,
-        step=0.01,
-        value=default_entry
-    )
-
-with col5:
-    st.caption("Strike / Expiry")
-    st.write(f"K={float(selected['strike']):.2f} | exp={expiry}")
-
-# (6) Data da operação
-trade_date = st.date_input("6) Data da operação", value=date.today())
-
-# (7) incluir
-def validate_new_leg(new_leg, existing_legs):
-    if existing_legs:
-        if new_leg["asset_id"] != existing_legs[0]["asset_id"]:
-            return False, "Todos os legs devem ter o MESMO underlying."
-        if new_leg["expiry"] != existing_legs[0]["expiry"]:
-            return False, "Todos os legs devem ter o MESMO expiry."
-        if new_leg["trade_date"] != existing_legs[0]["trade_date"]:
-            return False, "Todos os legs devem ter a MESMA data da operação (trade_date)."
-    if new_leg["contracts"] <= 0:
-        return False, "Quantidade inválida: contratos deve ser > 0."
-    return True, ""
-
-if st.button("7) Incluir LEG", type="primary"):
-    new_leg = {
-        "asset_id": asset_id,
-        "ticker": ticker,
-        "expiry": expiry,
-        "opt_type": opt_type,
-        "side": side,
-        "contracts": int(contracts),
-        "qty_shares": int(qty_shares),
-        "option_symbol": selected["option_symbol"],
-        "strike": float(selected["strike"]),
-        "entry_price": float(entry_price),
-        "ref_last_price": float(last_price) if last_price is not None else None,
-        "ref_collected_at": selected["collected_at"],
-        "trade_date": trade_date,
+    trade_row = {
+        "trade_id": trade_id,
+        "trade_date": pd.Timestamp(header["trade_date"]),
+        "asof_trade_date": pd.Timestamp(header["asof_trade_date"]) if header.get("asof_trade_date") else pd.NaT,
+        "strategy": header["strategy"],
+        "asset_id": int(header["asset_id"]),
+        "ticker": header["ticker"],
+        "direction": direction,
+        "status": "OPEN",
+        "quantity_multiplier": multiplier,
+        "fees": float(header.get("fees", 0.0)),
+        "underlying_spot": float(header.get("underlying_spot")) if header.get("underlying_spot") is not None else np.nan,
+        "thesis": header.get("thesis", ""),
+        "tags": header.get("tags", ""),
+        "notes": header.get("notes", ""),
+        "created_at": now,
+        "updated_at": now,
     }
 
-    ok, msg = validate_new_leg(new_leg, st.session_state.legs)
-    if not ok:
-        st.error(msg)
-    else:
-        new_leg["leg_no"] = len(st.session_state.legs) + 1
-        st.session_state.legs.append(new_leg)
-        st.success(f"LEG {new_leg['leg_no']} incluído.")
-
-st.divider()
-
-# ---------------- Legs editor ----------------
-st.subheader("Editor de LEGS")
-
-if not st.session_state.legs:
-    st.info("Nenhum leg incluído ainda.")
-else:
-    for leg in st.session_state.legs:
-        st.write(
-            f"LEG {leg['leg_no']}: {leg['side']} {leg['opt_type']} "
-            f"{leg['option_symbol']} K={leg['strike']:.2f} exp={leg['expiry']} "
-            f"qty={leg['qty_shares']} ({leg['contracts']} ctrt) entry={leg['entry_price']}"
+    leg_rows = []
+    next_leg_id = next_id(legs, "leg_id")
+    for idx, leg in enumerate(legs_payload, start=1):
+        leg_rows.append(
+            {
+                "leg_id": next_leg_id,
+                "trade_id": trade_id,
+                "leg_no": idx,
+                "side": str(leg["side"]).upper(),
+                "opt_type": str(leg["opt_type"]).upper(),
+                "expiry": pd.Timestamp(leg["expiry"]),
+                "strike": float(leg["strike"]),
+                "option_symbol": leg["option_symbol"],
+                "contracts": int(leg["contracts"]),
+                "entry_price": float(leg["entry_price"]),
+                "exit_price": np.nan,
+                "ref_last_price": float(leg["ref_last_price"]),
+                "created_at": now,
+                "updated_at": now,
+            }
         )
+        next_leg_id += 1
 
-    # direction preview do editor (antes de salvar)
-    dir_preview = direction_from_legs(st.session_state.legs, multiplier=100)
-    st.caption("Direction calculado (preview pela entrada de prêmio)")
-    st.write(dir_preview)
-
-    c1, c2, c3 = st.columns([1, 1, 2])
-    with c1:
-        if st.button("Remover último LEG"):
-            st.session_state.legs.pop()
-            st.rerun()
-    with c2:
-        if st.button("Limpar LEGS"):
-            st.session_state.legs = []
-            st.rerun()
-    with c3:
-        st.caption("Validações: mesma expiry/underlying/trade_date (versão atual).")
-
-st.divider()
-
-# ---------------- Save trade + legs ----------------
-st.subheader("Salvar operação")
-
-strategy = st.selectbox(
-    "Strategy",
-    options=["CUSTOM", "SELL_PUT", "BUY_DITM_CALL", "VERTICAL_SPREAD", "COVERED_CALL", "STRADDLE"],
-    index=0
-)
-fees = st.number_input("Fees (total)", min_value=0.0, step=0.01, value=0.0)
-notes = st.text_area("Notes", value="")
-
-def save_trade_and_legs():
-    if not st.session_state.legs:
-        st.error("Inclua ao menos 1 leg antes de salvar.")
-        return
-
-    td = st.session_state.legs[0]["trade_date"]
-
-    # spot snapshot (prefere o pregão de referência; se não houver, tenta pelo trade_date)
-    spot_row2 = q_one(
-        "SELECT close FROM daily_bars WHERE asset_id=%s AND trade_date=%s",
-        (asset_id, asof_trade_date),
-    )
-    spot2 = float(spot_row2["close"]) if spot_row2 and spot_row2["close"] is not None else None
-    if spot2 is None:
-        spot_row3 = q_one(
-            "SELECT close FROM daily_bars WHERE asset_id=%s AND trade_date=%s",
-            (asset_id, td),
-        )
-        spot2 = float(spot_row3["close"]) if spot_row3 and spot_row3["close"] is not None else None
-
-    # direction automático a partir do editor de legs
-    direction_auto = direction_from_legs(st.session_state.legs, multiplier=100)
-
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO option_trades
-                  (trade_date, strategy, asset_id, direction, status, quantity_multiplier,
-                   fees, notes, underlying_spot)
-                VALUES
-                  (%s, %s, %s, %s, 'OPEN', 100,
-                   %s, %s, %s)
-                """,
-                (td, strategy, asset_id, direction_auto, float(fees), notes, spot2)
-            )
-            trade_id = cur.lastrowid
-
-            now_ts = datetime.now()
-            for leg in st.session_state.legs:
-                cur.execute(
-                    """
-                    INSERT INTO option_trade_legs
-                      (trade_id, leg_no, side, opt_type, strike, expiry,
-                       contracts, entry_price, entry_dt, option_symbol)
-                    VALUES
-                      (%s, %s, %s, %s, %s, %s,
-                       %s, %s, %s, %s)
-                    """,
-                    (
-                        trade_id,
-                        leg["leg_no"],
-                        leg["side"],
-                        leg["opt_type"],
-                        leg["strike"],
-                        leg["expiry"],
-                        leg["contracts"],
-                        leg["entry_price"],
-                        now_ts,
-                        leg["option_symbol"],
-                    )
-                )
-
-        st.success(f"Operação salva! trade_id={trade_id} | direction={direction_auto} | legs={len(st.session_state.legs)}")
-        st.session_state.legs = []
-    except Exception as e:
-        st.error(f"Erro ao salvar: {e}")
-    finally:
-        conn.close()
-
-st.button("Salvar operação (trade + legs)", type="primary", on_click=save_trade_and_legs)
+    upsert_parquet(TRADES_PATH, pd.DataFrame([trade_row]), ["trade_id"], ["trade_id"])
+    upsert_parquet(LEGS_PATH, pd.DataFrame(leg_rows), ["leg_id"], ["trade_id", "leg_no"])
 
 
-# ============================================================
-#                      HISTÓRICO / EDIÇÃO
-# ============================================================
-st.divider()
-st.header("Histórico de operações (ver / corrigir / fechar / duplicar / remover)")
+def close_trade(trade_id: int, exit_prices: dict[str, float]):
+    trades, legs = load_trade_tables()
+    now = utcnow_ts()
+    leg_mask = pd.to_numeric(legs["trade_id"], errors="coerce") == int(trade_id)
+    for idx in legs[leg_mask].index:
+        symbol = legs.at[idx, "option_symbol"]
+        if symbol in exit_prices:
+            legs.at[idx, "exit_price"] = float(exit_prices[symbol])
+            legs.at[idx, "updated_at"] = now
+    trade_idx = trades.index[pd.to_numeric(trades["trade_id"], errors="coerce") == int(trade_id)]
+    if len(trade_idx):
+        trades.at[trade_idx[0], "status"] = "CLOSED"
+        trades.at[trade_idx[0], "closed_date"] = now
+        trades.at[trade_idx[0], "updated_at"] = now
+    upsert_parquet(TRADES_PATH, trades, ["trade_id"], ["trade_id"])
+    upsert_parquet(LEGS_PATH, legs, ["leg_id"], ["trade_id", "leg_no"])
 
-# ---- Filtros
-colf1, colf2, colf3, colf4 = st.columns([1, 1, 1, 1])
-with colf1:
-    only_status = st.selectbox("Filtrar status", options=["(todos)", "OPEN", "CLOSED", "CANCELLED"], index=0)
-with colf2:
-    only_ticker = st.selectbox("Filtrar underlying", options=["(todos)"] + list(asset_map.keys()), index=0)
-with colf3:
-    limit_n = st.number_input("Mostrar últimos N", min_value=10, max_value=500, step=10, value=50)
-with colf4:
-    show_only_with_legs = st.checkbox("Somente operações com legs", value=True)
 
-where = []
-params: List[Any] = []
+def update_trade(trade_id: int, header_updates: dict, edited_legs: pd.DataFrame):
+    trades, legs = load_trade_tables()
+    now = utcnow_ts()
+    trade_id = int(trade_id)
 
-if only_status != "(todos)":
-    where.append("t.status=%s")
-    params.append(only_status)
+    trade_mask = _normalize_id_series(trades["trade_id"]) == trade_id
+    if not trade_mask.any():
+        raise ValueError(f"Trade {trade_id} não encontrado.")
 
-if only_ticker != "(todos)":
-    where.append("a.ticker=%s")
-    params.append(only_ticker)
+    trade_idx = trades.index[trade_mask][0]
+    multiplier = int(header_updates.get("quantity_multiplier", trades.at[trade_idx, "quantity_multiplier"] or 100))
 
-if show_only_with_legs:
-    where.append("EXISTS (SELECT 1 FROM option_trade_legs l2 WHERE l2.trade_id=t.id)")
+    for key in ["trade_date", "asof_trade_date", "strategy", "ticker", "status", "fees", "underlying_spot", "thesis", "tags", "notes"]:
+        if key not in header_updates:
+            continue
+        value = header_updates[key]
+        if key in ("trade_date", "asof_trade_date") and value not in (None, "", pd.NaT):
+            value = pd.Timestamp(value)
+        trades.at[trade_idx, key] = value
 
-where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    if "asset_id" in header_updates:
+        trades.at[trade_idx, "asset_id"] = int(header_updates["asset_id"])
 
-trades = q_all(f"""
-SELECT
-  t.id,
-  t.trade_date,
-  t.strategy,
-  t.direction,
-  t.status,
-  t.fees,
-  t.underlying_spot,
-  a.ticker,
-  COUNT(l.id) AS n_legs,
-  MIN(l.expiry) AS exp_min,
-  MAX(l.expiry) AS exp_max
-FROM option_trades t
-JOIN assets a ON a.id = t.asset_id
-LEFT JOIN option_trade_legs l ON l.trade_id = t.id
-{where_sql}
-GROUP BY t.id, t.trade_date, t.strategy, t.direction, t.status, t.fees, t.underlying_spot, a.ticker
-ORDER BY t.trade_date DESC, t.id DESC
-LIMIT %s
-""", tuple(params + [int(limit_n)]))
+    edited = edited_legs.copy()
+    if edited.empty:
+        raise ValueError("A operação precisa ter pelo menos um leg.")
 
-if not trades:
-    st.info("Nenhuma operação encontrada com esses filtros.")
+    for col in ["strike", "contracts", "entry_price", "exit_price", "ref_last_price", "leg_id", "leg_no"]:
+        if col in edited.columns:
+            edited[col] = pd.to_numeric(edited[col], errors="coerce")
+    if "expiry" in edited.columns:
+        edited["expiry"] = pd.to_datetime(edited["expiry"], errors="coerce")
+
+    edited = edited.dropna(subset=["side", "opt_type", "expiry", "strike", "option_symbol", "contracts", "entry_price"]).copy()
+    if edited.empty:
+        raise ValueError("Todos os legs ficaram inválidos após a edição.")
+
+    current_trade_legs = legs.loc[_normalize_id_series(legs["trade_id"]) == trade_id].copy()
+    next_leg_id = next_id(legs, "leg_id")
+    leg_rows = []
+    direction_payload = []
+
+    for idx, row in enumerate(edited.itertuples(index=False), start=1):
+        leg_id = getattr(row, "leg_id", np.nan)
+        if pd.isna(leg_id):
+            leg_id = next_leg_id
+            next_leg_id += 1
+
+        existing = current_trade_legs.loc[_normalize_id_series(current_trade_legs["leg_id"]) == int(leg_id)].head(1)
+        created_at = existing.iloc[0]["created_at"] if not existing.empty and "created_at" in existing.columns else now
+        exit_price = getattr(row, "exit_price", np.nan)
+        exit_price = np.nan if pd.isna(exit_price) else float(exit_price)
+        ref_last_price = getattr(row, "ref_last_price", np.nan)
+        ref_last_price = np.nan if pd.isna(ref_last_price) else float(ref_last_price)
+
+        leg_payload = {
+            "leg_id": int(leg_id),
+            "trade_id": trade_id,
+            "leg_no": idx,
+            "side": str(row.side).upper(),
+            "opt_type": str(row.opt_type).upper(),
+            "expiry": pd.Timestamp(row.expiry),
+            "strike": float(row.strike),
+            "option_symbol": str(row.option_symbol),
+            "contracts": int(row.contracts),
+            "entry_price": float(row.entry_price),
+            "exit_price": exit_price,
+            "ref_last_price": ref_last_price,
+            "created_at": created_at,
+            "updated_at": now,
+        }
+        leg_rows.append(leg_payload)
+        direction_payload.append(leg_payload)
+
+    trades.at[trade_idx, "direction"] = direction_from_legs(direction_payload, multiplier)
+    trades.at[trade_idx, "quantity_multiplier"] = multiplier
+    trades.at[trade_idx, "updated_at"] = now
+
+    legs = legs.loc[_normalize_id_series(legs["trade_id"]) != trade_id].copy()
+    legs = pd.concat([legs, pd.DataFrame(leg_rows)], ignore_index=True, sort=False)
+    trades = trades.copy()
+
+    write_parquet(TRADES_PATH, trades.sort_values("trade_id").reset_index(drop=True))
+    write_parquet(LEGS_PATH, legs.sort_values(["trade_id", "leg_no"]).reset_index(drop=True))
+
+
+def delete_trade(trade_id: int):
+    trades, legs = load_trade_tables()
+    trade_id = int(trade_id)
+    trades = trades.loc[_normalize_id_series(trades["trade_id"]) != trade_id].copy()
+    legs = legs.loc[_normalize_id_series(legs["trade_id"]) != trade_id].copy()
+    write_parquet(TRADES_PATH, trades.reset_index(drop=True))
+    write_parquet(LEGS_PATH, legs.reset_index(drop=True))
+
+
+st.title("Histórico Estruturado de Operações")
+
+assets = load_assets()
+if assets.empty:
+    st.warning("Nenhum ativo ativo encontrado em `assets.parquet`.")
     st.stop()
 
-def fmt_trade(r):
-    exp = r["exp_min"] if r["exp_min"] == r["exp_max"] else f'{r["exp_min"]}..{r["exp_max"]}'
-    return (
-        f'#{r["id"]} | {r["trade_date"]} | {r["ticker"]} | {r["strategy"]} | '
-        f'{r["direction"]} | {r["status"]} | legs={r["n_legs"]} | exp={exp} | fees={r["fees"]}'
+tab_new, tab_history = st.tabs(["Nova Estrutura", "Histórico"])
+
+with tab_new:
+    st.subheader("Registrar operação estruturada")
+    if "draft_legs" not in st.session_state:
+        st.session_state.draft_legs = []
+
+    ticker = st.selectbox("Ativo", assets["ticker"].tolist())
+    asset_id = int(assets.loc[assets["ticker"] == ticker, "id"].iloc[0])
+    asof_trade_date, spot = latest_spot(asset_id)
+    quotes = load_quotes(asset_id)
+
+    st.caption(f"Pregão base: {asof_trade_date} | Spot: {spot if spot is not None else 'N/A'}")
+
+    strategy = st.selectbox(
+        "Estratégia",
+        [
+            "Covered Call",
+            "Bull Put Credit Spread",
+            "Bear Call Credit Spread",
+            "Bull Call Spread",
+            "Bear Put Spread",
+            "Long Straddle",
+            "Custom",
+        ],
     )
 
-trade_labels = [fmt_trade(r) for r in trades]
-idx = st.selectbox("Selecione uma operação", options=list(range(len(trade_labels))), format_func=lambda i: trade_labels[i])
-trade = trades[idx]
-trade_id = trade["id"]
+    col1, col2, col3, col4 = st.columns(4)
+    opt_type = col2.selectbox("Tipo", ["CALL", "PUT"])
+    default_expiry, default_subset, default_symbol = infer_defaults(quotes, spot, opt_type)
+    expiries = sorted([d for d in quotes["expiry_date"].dropna().unique().tolist()])
+    expiry_index = expiries.index(default_expiry) if default_expiry in expiries else 0
+    expiry = col1.selectbox("Vencimento", expiries, index=expiry_index) if expiries else None
+    subset = quotes[(quotes["expiry_date"] == expiry) & (quotes["option_type"] == opt_type)].copy()
+    subset["strike_dist"] = (pd.to_numeric(subset["strike"], errors="coerce") - float(spot or 0.0)).abs()
+    subset = subset.sort_values(["strike_dist", "trades", "volume", "strike", "option_symbol"], ascending=[True, False, False, True, True])
+    symbols = subset["option_symbol"].tolist()
+    default_symbol = default_symbol if default_symbol in symbols else (symbols[0] if symbols else None)
+    symbol_index = symbols.index(default_symbol) if default_symbol in symbols else 0
+    symbol = col3.selectbox("Opção", symbols, index=symbol_index) if symbols else None
+    side = col4.selectbox("Lado", ["BUY", "SELL"])
 
-# ---- carregar cabeçalho e legs
-head_row = q_one("""
-SELECT t.*, a.ticker
-FROM option_trades t
-JOIN assets a ON a.id=t.asset_id
-WHERE t.id=%s
-""", (trade_id,))
+    row = subset.loc[subset["option_symbol"] == symbol].head(1) if symbol else pd.DataFrame()
+    default_strike = float(row.iloc[0]["strike"]) if not row.empty else 0.0
+    default_last = float(row.iloc[0]["last_price"]) if not row.empty else 0.0
 
-legs_db = q_all("""
-SELECT *
-FROM option_trade_legs
-WHERE trade_id=%s
-ORDER BY leg_no
-""", (trade_id,))
+    col5, col6, col7 = st.columns(3)
+    contracts = col5.number_input("Contratos", min_value=1, value=1, step=1)
+    entry_price = col6.number_input("Preço de entrada", min_value=0.0, value=float(default_last), step=0.01)
+    ref_last = col7.number_input("Snapshot last_price", min_value=0.0, value=float(default_last), step=0.01)
 
-mult = int(head_row.get("quantity_multiplier") or 100)
-fees_db = float(head_row.get("fees") or 0.0)
-
-# Spot para % (prioriza snapshot; se não, tenta daily_bars no trade_date)
-spot_for_pct = head_row.get("underlying_spot")
-if spot_for_pct is None:
-    spot_row_hist = q_one(
-        "SELECT close FROM daily_bars WHERE asset_id=%s AND trade_date=%s",
-        (head_row["asset_id"], head_row["trade_date"]),
-    )
-    spot_for_pct = float(spot_row_hist["close"]) if spot_row_hist and spot_row_hist["close"] is not None else None
-
-# ---- direction auto (para exibir + (opcional) corrigir no DB)
-direction_auto_now = direction_from_legs(legs_db, multiplier=mult)
-
-# ---- P&L totals
-pnl_closed, pnl_partial, fully_closed = calc_trade_pnl_total(legs_db, fees=fees_db, multiplier=mult)
-
-# ---- modo de exibição do P&L
-pnl_mode = st.radio(
-    "Modo de P&L",
-    options=["Total (R$)", "Por 100 ações", "% do spot"],
-    horizontal=True
-)
-
-def format_pnl(value: Optional[float]) -> str:
-    if value is None:
-        return "-"
-    return f"{value:,.2f}"
-
-def pnl_in_mode(pnl_value: Optional[float]) -> Optional[float]:
-    if pnl_value is None:
-        return None
-    if pnl_mode == "Total (R$)":
-        return pnl_value
-    if pnl_mode == "Por 100 ações":
-        return pnl_per_100(pnl_value, legs_db)
-    # % do spot
-    return pnl_pct_spot(pnl_value, legs_db, spot=spot_for_pct, multiplier=mult)
-
-st.subheader(f"Operação #{trade_id} — detalhes")
-
-colh1, colh2, colh3, colh4, colh5, colh6 = st.columns([1, 1, 1, 1, 1, 1])
-with colh1:
-    st.caption("Underlying")
-    st.write(head_row["ticker"])
-with colh2:
-    st.caption("Trade date")
-    st.write(head_row["trade_date"])
-with colh3:
-    st.caption("Strategy")
-    st.write(head_row["strategy"])
-with colh4:
-    st.caption("Status / Fees")
-    st.write(f'{head_row["status"]} / {fees_db}')
-with colh5:
-    st.caption("Direction (DB / Auto)")
-    st.write(f'{head_row["direction"]} / {direction_auto_now}')
-with colh6:
-    st.caption("Spot p/ %")
-    st.write(spot_for_pct)
-
-st.markdown("**P&L (entry/exit) - fees**")
-if pnl_closed is not None:
-    st.write(f"Fechado: {format_pnl(pnl_in_mode(pnl_closed))}")
-else:
-    st.write(f"Parcial: {format_pnl(pnl_in_mode(pnl_partial))}  (ainda aberto: faltam exits)")
-
-st.markdown("**Legs**")
-if not legs_db:
-    st.info("Esta operação não possui legs.")
-else:
-    for l in legs_db:
-        lpnl = calc_leg_pnl(l, multiplier=mult)
-        # normaliza no modo (por leg)
-        if pnl_mode == "Total (R$)":
-            lpnl_disp = lpnl
-        elif pnl_mode == "Por 100 ações":
-            # por 100 ações: divide pela unidade-base (mesma do trade)
-            lpnl_disp = (lpnl / float(contract_base(legs_db))) if lpnl is not None else None
+    if st.button("Adicionar leg"):
+        if not symbol:
+            st.warning("Selecione uma opção com liquidez.")
         else:
-            lpnl_disp = pnl_pct_spot(lpnl, legs_db, spot=spot_for_pct, multiplier=mult) if lpnl is not None else None
+            st.session_state.draft_legs.append(
+                {
+                    "side": side,
+                    "opt_type": opt_type,
+                    "expiry": expiry,
+                    "strike": default_strike,
+                    "option_symbol": symbol,
+                    "contracts": int(contracts),
+                    "entry_price": float(entry_price),
+                    "ref_last_price": float(ref_last),
+                }
+            )
 
-        st.write(
-            f'LEG {l["leg_no"]}: {l["side"]} {l["opt_type"]} {l["option_symbol"]} '
-            f'K={float(l["strike"]):.2f} exp={l["expiry"]} '
-            f'ctrt={l["contracts"]} entry={float(l["entry_price"]):.4f} '
-            f'exit={l["exit_price"] if l["exit_price"] is not None else "-"} '
-            f'| P&L={format_pnl(lpnl_disp)}'
+    draft_df = pd.DataFrame(st.session_state.draft_legs)
+    st.dataframe(draft_df, use_container_width=True, hide_index=True)
+
+    trade_date = st.date_input("Data da operação", value=date.today())
+    fees = st.number_input("Custos totais", min_value=0.0, value=0.0, step=0.01)
+    thesis = st.text_input("Tese")
+    tags = st.text_input("Tags")
+    notes = st.text_area("Notas")
+
+    if st.button("Salvar operação estruturada", type="primary"):
+        if draft_df.empty:
+            st.warning("Adicione ao menos um leg.")
+        else:
+            save_trade(
+                {
+                    "trade_date": trade_date,
+                    "asof_trade_date": asof_trade_date,
+                    "strategy": strategy,
+                    "asset_id": asset_id,
+                    "ticker": ticker,
+                    "quantity_multiplier": 100,
+                    "fees": fees,
+                    "underlying_spot": spot,
+                    "thesis": thesis,
+                    "tags": tags,
+                    "notes": notes,
+                },
+                st.session_state.draft_legs,
+            )
+            st.session_state.draft_legs = []
+            st.success("Operação salva em parquet.")
+
+with tab_history:
+    trades, legs = load_trade_tables()
+    if trades.empty:
+        st.info("Ainda não há operações registradas.")
+        st.stop()
+
+    pnl_rows = []
+    for trade in trades.itertuples(index=False):
+        trade_id_value = _normalize_id_scalar(trade.trade_id)
+        trade_legs = legs[_normalize_id_series(legs["trade_id"]) == trade_id_value].copy()
+        fee = float(getattr(trade, "fees", 0.0) or 0.0)
+        pnl = 0.0
+        closed_count = 0
+        for leg in trade_legs.itertuples(index=False):
+            qty_mult = _normalize_id_scalar(getattr(trade, "quantity_multiplier", 100) or 100)
+            leg_pnl = calc_leg_pnl(pd.Series(leg._asdict()), int(qty_mult))
+            if leg_pnl is not None:
+                pnl += leg_pnl
+                closed_count += 1
+        pnl_rows.append(
+            {
+                "trade_id": int(trade_id_value),
+                "ticker": getattr(trade, "ticker", ""),
+                "strategy": getattr(trade, "strategy", ""),
+                "status": getattr(trade, "status", ""),
+                "trade_date": getattr(trade, "trade_date", pd.NaT),
+                "legs": len(trade_legs),
+                "legs_fechados": closed_count,
+                "pnl_total": pnl - fee,
+                "fees": fee,
+                "tags": getattr(trade, "tags", ""),
+            }
         )
 
-st.divider()
-st.subheader("Ações: editar / fechar / duplicar / remover")
+    pnl_df = pd.DataFrame(pnl_rows).sort_values(["status", "trade_date"], ascending=[True, False])
+    st.dataframe(pnl_df, use_container_width=True, hide_index=True)
 
-tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["Direction (auto)", "Editar cabeçalho", "Editar um LEG", "Fechar operação (auto)", "Duplicar operação", "Remover operação"]
-)
+    trade_id = st.selectbox("Selecionar trade", pnl_df["trade_id"].tolist())
+    selected_trade = trades.loc[_normalize_id_series(trades["trade_id"]) == int(trade_id)].iloc[0]
+    selected_legs = legs.loc[_normalize_id_series(legs["trade_id"]) == int(trade_id)].copy()
 
-# ---------- Direction (auto): corrigir DB se divergir ----------
-with tab0:
-    st.info("Direction é calculado pela entrada líquida de prêmio (cashflow).")
-    if head_row["direction"] != direction_auto_now:
-        st.warning(f"DB está {head_row['direction']} mas o cálculo dá {direction_auto_now}.")
-        if st.button("Atualizar direction no DB para o valor automático", type="primary"):
-            try:
-                recompute_and_update_direction(trade_id)
-                st.success("Direction atualizado no DB.")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Erro ao atualizar direction: {e}")
-    else:
-        st.success("Direction no DB está consistente com o cálculo automático.")
+    st.write("**Cabeçalho**")
+    st.json(
+        {
+            "ticker": selected_trade.get("ticker"),
+            "strategy": selected_trade.get("strategy"),
+            "direction": selected_trade.get("direction"),
+            "status": selected_trade.get("status"),
+            "trade_date": str(selected_trade.get("trade_date")),
+            "thesis": selected_trade.get("thesis"),
+            "tags": selected_trade.get("tags"),
+            "notes": selected_trade.get("notes"),
+        }
+    )
 
-# ---------- Editar cabeçalho ----------
-with tab1:
-    with st.form(key=f"edit_head_{trade_id}"):
-        new_trade_date = st.date_input("trade_date", value=head_row["trade_date"])
-        new_strategy = st.selectbox(
-            "strategy",
-            options=["CUSTOM", "SELL_PUT", "BUY_DITM_CALL", "VERTICAL_SPREAD", "COVERED_CALL", "STRADDLE"],
-            index=0 if head_row["strategy"] not in ["CUSTOM", "SELL_PUT", "BUY_DITM_CALL", "VERTICAL_SPREAD", "COVERED_CALL", "STRADDLE"]
-            else ["CUSTOM", "SELL_PUT", "BUY_DITM_CALL", "VERTICAL_SPREAD", "COVERED_CALL", "STRADDLE"].index(head_row["strategy"])
-        )
-        new_status = st.selectbox("status", options=["OPEN", "CLOSED", "CANCELLED"], index=["OPEN","CLOSED","CANCELLED"].index(head_row["status"]))
-        new_fees = st.number_input("fees", min_value=0.0, step=0.01, value=float(head_row["fees"] or 0.0))
-        new_notes = st.text_area("notes", value=head_row["notes"] or "")
+    st.write("**Legs**")
+    st.dataframe(selected_legs, use_container_width=True, hide_index=True)
 
-        st.caption("direction é automático (não editável aqui).")
+    st.write("**Editar operação**")
+    edit_col1, edit_col2, edit_col3 = st.columns(3)
+    editable_trade_date = pd.to_datetime(selected_trade.get("trade_date"), errors="coerce")
+    editable_asof = pd.to_datetime(selected_trade.get("asof_trade_date"), errors="coerce")
 
-        submitted = st.form_submit_button("Salvar alterações do cabeçalho")
-        if submitted:
-            conn = get_conn()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        UPDATE option_trades
-                        SET trade_date=%s, strategy=%s, status=%s, fees=%s, notes=%s
-                        WHERE id=%s
-                    """, (new_trade_date, new_strategy, new_status, new_fees, new_notes, trade_id))
-                # direction pode ter mudado se editar legs depois; aqui só garante consistência
-                recompute_and_update_direction(trade_id)
-                st.success("Cabeçalho atualizado.")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Erro ao atualizar cabeçalho: {e}")
-            finally:
-                conn.close()
+    edit_trade_date = edit_col1.date_input(
+        "Data da operação",
+        value=(editable_trade_date.date() if pd.notna(editable_trade_date) else date.today()),
+        key=f"edit_trade_date_{trade_id}",
+    )
+    edit_asof_date = edit_col2.date_input(
+        "Pregão de referência",
+        value=(editable_asof.date() if pd.notna(editable_asof) else date.today()),
+        key=f"edit_asof_{trade_id}",
+    )
+    edit_status = edit_col3.selectbox(
+        "Status",
+        ["OPEN", "CLOSED"],
+        index=(0 if str(selected_trade.get("status", "OPEN")).upper() == "OPEN" else 1),
+        key=f"edit_status_{trade_id}",
+    )
 
-# ---------- Editar um LEG ----------
-with tab2:
-    if not legs_db:
-        st.warning("Esta operação não possui legs.")
-    else:
-        leg_choices = [
-            f'LEG {l["leg_no"]} | {l["side"]} {l["opt_type"]} {l["option_symbol"]} exp={l["expiry"]}'
-            for l in legs_db
-        ]
-        leg_idx = st.selectbox("Escolha o leg", options=list(range(len(leg_choices))), format_func=lambda i: leg_choices[i])
-        leg = legs_db[leg_idx]
+    edit_col4, edit_col5, edit_col6 = st.columns(3)
+    edit_strategy = edit_col4.text_input("Estratégia", value=str(selected_trade.get("strategy", "")), key=f"edit_strategy_{trade_id}")
+    edit_fees = edit_col5.number_input("Custos", min_value=0.0, value=float(selected_trade.get("fees", 0.0) or 0.0), step=0.01, key=f"edit_fees_{trade_id}")
+    edit_spot = edit_col6.number_input(
+        "Spot de referência",
+        min_value=0.0,
+        value=float(selected_trade.get("underlying_spot", 0.0) or 0.0),
+        step=0.01,
+        key=f"edit_spot_{trade_id}",
+    )
 
-        with st.form(key=f"edit_leg_{trade_id}_{leg['id']}"):
-            qty_shares_edit = st.number_input(
-                "Quantidade (ações) — múltiplos de 100",
-                min_value=100,
-                step=100,
-                value=int(leg["contracts"]) * 100
-            )
-            contracts_edit = int(qty_shares_edit // 100)
+    edit_col7, edit_col8 = st.columns(2)
+    edit_thesis = edit_col7.text_input("Tese", value=str(selected_trade.get("thesis", "") or ""), key=f"edit_thesis_{trade_id}")
+    edit_tags = edit_col8.text_input("Tags", value=str(selected_trade.get("tags", "") or ""), key=f"edit_tags_{trade_id}")
+    edit_notes = st.text_area("Notas", value=str(selected_trade.get("notes", "") or ""), key=f"edit_notes_{trade_id}")
 
-            entry_price_edit = st.number_input(
-                "entry_price",
-                min_value=0.0,
-                step=0.01,
-                value=float(leg["entry_price"])
-            )
+    editable_legs = selected_legs.copy()
+    if not editable_legs.empty:
+        editable_legs["expiry"] = pd.to_datetime(editable_legs["expiry"], errors="coerce").dt.date
+    editable_cols = [
+        "leg_id",
+        "leg_no",
+        "side",
+        "opt_type",
+        "expiry",
+        "strike",
+        "option_symbol",
+        "contracts",
+        "entry_price",
+        "exit_price",
+        "ref_last_price",
+    ]
+    editable_cols = [c for c in editable_cols if c in editable_legs.columns]
+    edited_legs = st.data_editor(
+        editable_legs[editable_cols],
+        key=f"edit_legs_{trade_id}",
+        use_container_width=True,
+        hide_index=True,
+        num_rows="dynamic",
+        column_config={
+            "leg_id": st.column_config.NumberColumn("leg_id", disabled=True),
+            "leg_no": st.column_config.NumberColumn("leg_no", disabled=True),
+            "side": st.column_config.SelectboxColumn("side", options=["BUY", "SELL"], required=True),
+            "opt_type": st.column_config.SelectboxColumn("opt_type", options=["CALL", "PUT"], required=True),
+            "expiry": st.column_config.DateColumn("expiry", format="YYYY-MM-DD"),
+            "strike": st.column_config.NumberColumn("strike", format="%.4f"),
+            "contracts": st.column_config.NumberColumn("contracts", format="%d"),
+            "entry_price": st.column_config.NumberColumn("entry_price", format="%.4f"),
+            "exit_price": st.column_config.NumberColumn("exit_price", format="%.4f"),
+            "ref_last_price": st.column_config.NumberColumn("ref_last_price", format="%.4f"),
+        },
+    )
 
-            exit_price_default = float(leg["exit_price"]) if leg["exit_price"] is not None else 0.0
-            exit_price_edit = st.number_input(
-                "exit_price (0 = vazio)",
-                min_value=0.0,
-                step=0.01,
-                value=exit_price_default
-            )
-            set_exit_dt = st.checkbox("Definir exit_dt como agora", value=False)
-
-            submitted = st.form_submit_button("Salvar alterações do LEG")
-            if submitted:
-                conn = get_conn()
-                try:
-                    with conn.cursor() as cur:
-                        exit_price_sql = None if float(exit_price_edit) == 0.0 else float(exit_price_edit)
-                        exit_dt_sql = datetime.now() if set_exit_dt else leg["exit_dt"]
-                        cur.execute("""
-                            UPDATE option_trade_legs
-                            SET contracts=%s, entry_price=%s, exit_price=%s, exit_dt=%s
-                            WHERE id=%s
-                        """, (contracts_edit, float(entry_price_edit), exit_price_sql, exit_dt_sql, leg["id"]))
-
-                    # direction pode mudar se entry_price mudar
-                    recompute_and_update_direction(trade_id)
-
-                    st.success("LEG atualizado.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Erro ao atualizar leg: {e}")
-                finally:
-                    conn.close()
-
-# ---------- Fechar operação automaticamente ----------
-with tab3:
-    if not legs_db:
-        st.warning("Sem legs para fechar.")
-    else:
-        st.info("Informe somente os exit_prices (>0). O sistema grava exit_dt=agora e seta status='CLOSED'.")
-        with st.form(key=f"close_trade_{trade_id}"):
-            exit_inputs = {}
-            for l in legs_db:
-                key = f"exit_{trade_id}_{l['id']}"
-                default_val = float(l["exit_price"]) if l["exit_price"] is not None else 0.0
-                exit_inputs[l["id"]] = st.number_input(
-                    f'LEG {l["leg_no"]} — {l["side"]} {l["opt_type"]} {l["option_symbol"]} | exit_price',
-                    min_value=0.0,
-                    step=0.01,
-                    value=default_val,
-                    key=key
-                )
-
-            submitted = st.form_submit_button("Fechar operação agora")
-            if submitted:
-                missing = [lid for lid, v in exit_inputs.items() if float(v) <= 0.0]
-                if missing:
-                    st.error("Preencha exit_price (>0) para TODOS os legs antes de fechar.")
-                else:
-                    conn = get_conn()
-                    try:
-                        with conn.cursor() as cur:
-                            now_ts = datetime.now()
-                            for l in legs_db:
-                                cur.execute("""
-                                    UPDATE option_trade_legs
-                                    SET exit_price=%s, exit_dt=%s
-                                    WHERE id=%s
-                                """, (float(exit_inputs[l["id"]]), now_ts, l["id"]))
-
-                            cur.execute("""
-                                UPDATE option_trades
-                                SET status='CLOSED'
-                                WHERE id=%s
-                            """, (trade_id,))
-
-                        # direction continua sendo o da entrada, mas mantemos consistente
-                        recompute_and_update_direction(trade_id)
-
-                        st.success("Operação fechada.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Erro ao fechar operação: {e}")
-                    finally:
-                        conn.close()
-
-# ---------- Duplicar operação ----------
-with tab4:
-    st.info("Duplica o trade e os legs (mantém entry_price/side/etc.), zera exit e cria novo trade OPEN com trade_date=hoje.")
-    new_trade_date = st.date_input("trade_date do novo trade", value=date.today(), key=f"dup_td_{trade_id}")
-    new_notes = st.text_area("notes do novo trade (opcional)", value="", key=f"dup_notes_{trade_id}")
-
-    confirm_dup = st.checkbox("Confirmo duplicar esta operação.", value=False, key=f"dup_confirm_{trade_id}")
-    if st.button("Duplicar operação", type="primary", disabled=not confirm_dup):
-        conn = get_conn()
+    action_col1, action_col2 = st.columns(2)
+    if action_col1.button("Salvar edições da operação", key=f"save_edit_{trade_id}", use_container_width=True):
         try:
-            with conn.cursor() as cur:
-                # direction automático (entrada) baseado nos legs originais
-                dir_dup = direction_from_legs(legs_db, multiplier=mult)
-
-                # cria novo header (OPEN)
-                cur.execute(
-                    """
-                    INSERT INTO option_trades
-                      (trade_date, strategy, asset_id, direction, status, quantity_multiplier,
-                       fees, notes, underlying_spot)
-                    VALUES
-                      (%s, %s, %s, %s, 'OPEN', %s,
-                       %s, %s, %s)
-                    """,
-                    (
-                        new_trade_date,
-                        head_row["strategy"],
-                        head_row["asset_id"],
-                        dir_dup,
-                        int(head_row.get("quantity_multiplier") or 100),
-                        float(head_row.get("fees") or 0.0),
-                        new_notes if new_notes.strip() else (head_row.get("notes") or None),
-                        head_row.get("underlying_spot"),
-                    )
-                )
-                new_trade_id = cur.lastrowid
-
-                now_ts = datetime.now()
-                for l in legs_db:
-                    cur.execute(
-                        """
-                        INSERT INTO option_trade_legs
-                          (trade_id, leg_no, side, opt_type, strike, expiry,
-                           contracts, entry_price, entry_dt, option_symbol,
-                           exit_price, exit_dt)
-                        VALUES
-                          (%s, %s, %s, %s, %s, %s,
-                           %s, %s, %s, %s,
-                           NULL, NULL)
-                        """,
-                        (
-                            new_trade_id,
-                            l["leg_no"],
-                            l["side"],
-                            l["opt_type"],
-                            l["strike"],
-                            l["expiry"],
-                            l["contracts"],
-                            l["entry_price"],
-                            now_ts,
-                            l["option_symbol"],
-                        )
-                    )
-
-            # garante direction coerente (caso alguém mexa no futuro)
-            recompute_and_update_direction(new_trade_id)
-
-            st.success(f"Duplicado! novo trade_id={new_trade_id}")
+            update_trade(
+                int(trade_id),
+                {
+                    "trade_date": edit_trade_date,
+                    "asof_trade_date": edit_asof_date,
+                    "strategy": edit_strategy,
+                    "asset_id": int(selected_trade.get("asset_id")),
+                    "ticker": str(selected_trade.get("ticker")),
+                    "status": edit_status,
+                    "fees": edit_fees,
+                    "underlying_spot": edit_spot,
+                    "thesis": edit_thesis,
+                    "tags": edit_tags,
+                    "notes": edit_notes,
+                    "quantity_multiplier": int(selected_trade.get("quantity_multiplier", 100) or 100),
+                },
+                edited_legs,
+            )
+            st.success("Operação atualizada.")
             st.rerun()
-        except Exception as e:
-            st.error(f"Erro ao duplicar: {e}")
-        finally:
-            conn.close()
+        except Exception as exc:
+            st.error(f"Falha ao atualizar a operação: {exc}")
 
-# ---------- Remover operação ----------
-with tab5:
-    st.warning("Remover apaga o trade e todos os legs (ON DELETE CASCADE).")
-    confirm_del = st.checkbox("Confirmo que desejo remover esta operação.", value=False, key=f"del_confirm_{trade_id}")
-    if st.button("REMOVER operação", type="primary", disabled=not confirm_del):
-        conn = get_conn()
+    confirm_delete = action_col2.checkbox("Confirmar exclusão permanente", key=f"confirm_delete_{trade_id}")
+    if action_col2.button("Remover operação estruturada", key=f"delete_trade_{trade_id}", use_container_width=True, disabled=not confirm_delete):
         try:
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM option_trades WHERE id=%s", (trade_id,))
+            delete_trade(int(trade_id))
             st.success("Operação removida.")
             st.rerun()
-        except Exception as e:
-            st.error(f"Erro ao remover operação: {e}")
-        finally:
-            conn.close()
+        except Exception as exc:
+            st.error(f"Falha ao remover a operação: {exc}")
+
+    open_legs = selected_legs[selected_legs["exit_price"].isna()].copy()
+    if not open_legs.empty:
+        st.write("**Fechamento da estrutura**")
+        exit_prices = {}
+        cols = st.columns(max(1, len(open_legs)))
+        for col, leg in zip(cols, open_legs.itertuples(index=False)):
+            exit_prices[str(leg.option_symbol)] = col.number_input(
+                f"{leg.option_symbol} exit",
+                min_value=0.0,
+                value=float(leg.ref_last_price) if pd.notna(leg.ref_last_price) else 0.0,
+                step=0.01,
+                key=f"exit_{trade_id}_{leg.option_symbol}",
+            )
+        if st.button("Fechar trade selecionado"):
+            close_trade(int(trade_id), exit_prices)
+            st.success("Trade fechado e legs atualizados.")
