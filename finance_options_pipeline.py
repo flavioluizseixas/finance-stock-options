@@ -2,6 +2,7 @@
 
 import math
 import os
+import re
 from dataclasses import asdict, dataclass
 from datetime import date
 from pathlib import Path
@@ -189,6 +190,31 @@ def add_indicators_one(df: pd.DataFrame, cfg: CFG) -> pd.DataFrame:
     return d
 
 
+def _concat_compat_local(frames: list[pd.DataFrame]) -> pd.DataFrame:
+    valid = [frame.copy() for frame in frames if frame is not None and not frame.empty]
+    if not valid:
+        return pd.DataFrame()
+    if len(valid) == 1:
+        return valid[0].reset_index(drop=True)
+
+    all_cols: list[str] = []
+    for frame in valid:
+        for col in frame.columns:
+            if col not in all_cols:
+                all_cols.append(col)
+
+    prepared = []
+    for frame in valid:
+        keep_cols = [col for col in frame.columns if not frame[col].isna().all()]
+        prepared.append(frame[keep_cols] if keep_cols else frame.iloc[:, 0:0])
+
+    merged = pd.concat(prepared, ignore_index=True, sort=False)
+    for col in all_cols:
+        if col not in merged.columns:
+            merged[col] = np.nan
+    return merged[all_cols]
+
+
 def load_curve_from_b3_file(path: str) -> pd.DataFrame:
     df = pd.read_csv(path) if path.lower().endswith(".csv") else pd.read_excel(path)
     df.columns = [col.strip().lower() for col in df.columns]
@@ -249,12 +275,50 @@ def optionchaindate(subjacente: str, vencimento: str) -> pd.DataFrame:
     )
     data = requests.get(url, timeout=30).json()
     rows = []
+
+    def _safe_item(values: list, idx: int):
+        return values[idx] if idx < len(values) else None
+
     for item in data.get("data", {}).get("cotacoesOpcoes", []):
-        ativo = str(item[0]).split("_")[0]
-        rows.append([subjacente, vencimento, ativo, item[2], item[3], item[5], item[8], item[9], item[10]])
+        ativo = str(_safe_item(item, 0)).split("_")[0]
+        rows.append(
+            [
+                subjacente,
+                vencimento,
+                ativo,
+                _safe_item(item, 2),   # tipo
+                _safe_item(item, 3),   # mod.
+                _safe_item(item, 5),   # strike
+                _safe_item(item, 8),   # ultimo
+                _safe_item(item, 9),   # negocios
+                _safe_item(item, 10),  # volume
+                _safe_item(item, 11),  # data/hora
+                _safe_item(item, 12),  # vol implicita
+                _safe_item(item, 13),  # delta
+                _safe_item(item, 14),  # gamma
+                _safe_item(item, 15),  # theta
+                _safe_item(item, 16),  # vega
+            ]
+        )
     return pd.DataFrame(
         rows,
-        columns=["subjacente", "vencimento", "ativo", "tipo", "modelo", "strike", "preco", "negocios", "volume"],
+        columns=[
+            "subjacente",
+            "vencimento",
+            "ativo",
+            "tipo",
+            "modelo",
+            "strike",
+            "preco",
+            "negocios",
+            "volume",
+            "data_hora",
+            "iv_site_raw",
+            "delta_site_raw",
+            "gamma_site_raw",
+            "theta_site_raw",
+            "vega_site_raw",
+        ],
     )
 
 
@@ -271,9 +335,92 @@ def optionchain(subjacente: str) -> pd.DataFrame:
     frames = [frame for frame in frames if frame is not None and not frame.empty]
     if not frames:
         return pd.DataFrame(
-            columns=["subjacente", "vencimento", "ativo", "tipo", "modelo", "strike", "preco", "negocios", "volume"]
+            columns=[
+                "subjacente",
+                "vencimento",
+                "ativo",
+                "tipo",
+                "modelo",
+                "strike",
+                "preco",
+                "negocios",
+                "volume",
+                "data_hora",
+                "iv_site_raw",
+                "delta_site_raw",
+                "gamma_site_raw",
+                "theta_site_raw",
+                "vega_site_raw",
+            ]
         )
-    return pd.concat(frames, ignore_index=True)
+    return _concat_compat_local(frames).reset_index(drop=True)
+
+
+def _parse_site_numeric(value) -> float:
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return np.nan
+    if isinstance(value, (int, float, np.number)):
+        return float(value)
+    text = str(value).strip()
+    if not text or "<img" in text.lower():
+        return np.nan
+    text = re.sub(r"<[^>]+>", "", text)
+    text = text.replace("%", "").replace(" ", "").replace("\xa0", "")
+    if "," in text and "." in text:
+        text = text.replace(".", "").replace(",", ".")
+    elif "," in text:
+        text = text.replace(",", ".")
+    try:
+        return float(text)
+    except Exception:
+        return np.nan
+
+
+def fetch_open_interest(subjacente: str, limit: int = 6000) -> pd.DataFrame:
+    params = {
+        "z": str(int(pd.Timestamp.now().timestamp() / 10)),
+        "r0t": "OpenInterest",
+        "r0p.descending": "true",
+        "r0p.sort_expression": "uncovered",
+        "r0p.limit": str(limit),
+        "r0p.underlying_assets_ids": subjacente,
+    }
+    try:
+        response = requests.get("https://opcoes.net.br/api/v1", params=params, timeout=30)
+        response.raise_for_status()
+        payload = response.json()
+        reqs = payload.get("requests", [])
+        if not reqs:
+            return pd.DataFrame()
+        results = reqs[0].get("results", {})
+        fields = results.get("data_fields", [])
+        rows = results.get("data_rows", [])
+        if not fields or not rows:
+            return pd.DataFrame()
+        out = pd.DataFrame(rows, columns=fields)
+        if "ticker" not in out.columns:
+            return pd.DataFrame()
+        keep = {
+            "ticker": "option_symbol",
+            "covered": "coberto",
+            "blocked": "travado",
+            "uncovered": "descoberto",
+            "buyers": "titulares",
+            "sellers": "lancadores",
+            "notional_uncovered": "notional_descoberto",
+            "iq": "iq_oi",
+        }
+        for src in keep:
+            if src not in out.columns:
+                out[src] = np.nan
+        out = out[list(keep.keys())].rename(columns=keep)
+        out["option_symbol"] = out["option_symbol"].astype(str).str.strip()
+        for col in ["coberto", "travado", "descoberto", "titulares", "lancadores", "notional_descoberto", "iq_oi"]:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+        out = out.sort_values(["option_symbol"]).drop_duplicates(subset=["option_symbol"], keep="last")
+        return out.reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
 
 
 def _norm_cdf(x: float) -> float:
@@ -401,6 +548,16 @@ def build_option_quote_frame(asset_id: int, trade_date: date, df_opt: pd.DataFra
     out["last_price"] = pd.to_numeric(out["preco"], errors="coerce")
     out["trades"] = pd.to_numeric(out["negocios"], errors="coerce")
     out["volume"] = pd.to_numeric(out["volume"], errors="coerce")
+    out["iv"] = out["iv_site_raw"].map(_parse_site_numeric)
+    out["delta"] = out["delta_site_raw"].map(_parse_site_numeric)
+    out["gamma"] = out["gamma_site_raw"].map(_parse_site_numeric)
+    out["theta"] = out["theta_site_raw"].map(_parse_site_numeric)
+    out["vega"] = out["vega_site_raw"].map(_parse_site_numeric)
+    out["iv"] = np.where(out["iv"] > 3, out["iv"] / 100.0, out["iv"])
+    for col in ["coberto", "travado", "descoberto", "titulares", "lancadores", "notional_descoberto", "iq_oi"]:
+        if col not in out.columns:
+            out[col] = np.nan
+        out[col] = pd.to_numeric(out[col], errors="coerce")
     out["collected_at"] = now
     out = out.dropna(subset=["expiry_date", "option_symbol", "option_type", "strike"]).copy()
     return out[
@@ -415,6 +572,18 @@ def build_option_quote_frame(asset_id: int, trade_date: date, df_opt: pd.DataFra
             "last_price",
             "trades",
             "volume",
+            "iv",
+            "delta",
+            "gamma",
+            "theta",
+            "vega",
+            "coberto",
+            "travado",
+            "descoberto",
+            "titulares",
+            "lancadores",
+            "notional_descoberto",
+            "iq_oi",
             "collected_at",
         ]
     ]
@@ -454,6 +623,12 @@ def build_option_model_frame(
         market_price = float(opt.last_price) if pd.notna(opt.last_price) else np.nan
         is_call = str(opt.option_type).upper() == "CALL"
         rate_r = curve_rate(df_curve, bd)
+        iv_site = _parse_site_numeric(getattr(opt, "iv", np.nan))
+        iv_site = (iv_site / 100.0) if np.isfinite(iv_site) and iv_site > 3 else iv_site
+        delta_site = _parse_site_numeric(getattr(opt, "delta", np.nan))
+        gamma_site = _parse_site_numeric(getattr(opt, "gamma", np.nan))
+        theta_site = _parse_site_numeric(getattr(opt, "theta", np.nan))
+        vega_site = _parse_site_numeric(getattr(opt, "vega", np.nan))
         iv = implied_vol_newton(
             market_price=market_price,
             S=float(spot),
@@ -468,11 +643,11 @@ def build_option_model_frame(
         )
 
         if iv is not None:
-            bsm_price, delta, gamma, vega, theta, rho = bsm_price_greeks(
+            bsm_price, delta_calc, gamma_calc, vega_calc, theta_calc, rho = bsm_price_greeks(
                 float(spot), strike, t_years, rate_r, q, float(iv), is_call
             )
         else:
-            bsm_price = delta = gamma = vega = theta = rho = np.nan
+            bsm_price = delta_calc = gamma_calc = vega_calc = theta_calc = rho = np.nan
 
         if hv is not None:
             bsm_price_histvol, *_ = bsm_price_greeks(float(spot), strike, t_years, rate_r, q, hv, is_call)
@@ -491,15 +666,15 @@ def build_option_model_frame(
                 "rate_r": float(rate_r),
                 "dividend_q": float(q),
                 "t_years": float(t_years),
-                "iv": iv,
+                "iv": (iv_site if np.isfinite(iv_site) and iv_site > 0 else iv),
                 "bsm_price": bsm_price,
                 "bsm_price_histvol": bsm_price_histvol,
                 "mispricing": mispricing,
                 "mispricing_pct": mispricing_pct,
-                "delta": delta,
-                "gamma": gamma,
-                "vega": vega,
-                "theta": theta,
+                "delta": (delta_site if np.isfinite(delta_site) else delta_calc),
+                "gamma": (gamma_site if np.isfinite(gamma_site) else gamma_calc),
+                "vega": (vega_site if np.isfinite(vega_site) else vega_calc),
+                "theta": (theta_site if np.isfinite(theta_site) else theta_calc),
                 "rho": rho,
                 "hist_vol_annual": hv,
                 "collected_at": now,
@@ -615,6 +790,10 @@ def update_underlying_history(cfg: CFG, ticker: str, asset_id: int) -> dict:
 def update_option_chain(cfg: CFG, ticker: str, asset_id: int, trade_date: date) -> dict:
     subj = ticker.replace(".SA", "").replace(".sa", "")
     raw_chain = optionchain(subj)
+    oi = fetch_open_interest(subj)
+    if not oi.empty and "ativo" in raw_chain.columns:
+        raw_chain = raw_chain.merge(oi, how="left", left_on="ativo", right_on="option_symbol")
+        raw_chain = raw_chain.drop(columns=["option_symbol"], errors="ignore")
     quote_frame = build_option_quote_frame(asset_id, trade_date, raw_chain)
     upsert_parquet(
         table_path("option_quote", BASE_DIR),

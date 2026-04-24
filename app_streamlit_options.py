@@ -121,6 +121,29 @@ def load_chain(asset_id: int, trade_date: date) -> pd.DataFrame:
         mm = mm.rename(columns={"collected_at": "model_collected_at"})
 
     out = q.merge(mm, how="left", on=["asset_id", "trade_date", "option_symbol"], suffixes=("", "_m"))
+    # Prioriza valores vindos do site (quote); usa modelo calculado apenas como fallback.
+    for col in [
+        "iv",
+        "delta",
+        "gamma",
+        "vega",
+        "theta",
+        "rho",
+        "bsm_price",
+        "bsm_price_histvol",
+        "mispricing",
+        "mispricing_pct",
+        "hist_vol_annual",
+        "spot",
+        "rate_r",
+        "dividend_q",
+        "t_years",
+    ]:
+        model_col = f"{col}_m"
+        if col in out.columns and model_col in out.columns:
+            out[col] = out[col].where(out[col].notna(), out[model_col])
+        elif model_col in out.columns and col not in out.columns:
+            out[col] = out[model_col]
     return out.sort_values(["expiry_date", "option_type", "strike"]).reset_index(drop=True)
 
 
@@ -177,6 +200,100 @@ def build_universe(selected_ticker: str) -> tuple[pd.DataFrame, pd.DataFrame]:
         )
 
     return (pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(), pd.DataFrame(meta_rows))
+
+
+def optimize_universe_table(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    drop_cols = [col for col in out.columns if col.endswith("_m")]
+    drop_cols += [
+        col
+        for col in [
+            "model_code",
+            "quote_collected_at",
+            "iv_calc",
+            "iv_site",
+            "delta_site",
+            "gamma_site",
+            "theta_site",
+            "vega_site",
+            "iv_site_raw",
+            "delta_site_raw",
+            "gamma_site_raw",
+            "theta_site_raw",
+            "vega_site_raw",
+        ]
+        if col in out.columns
+    ]
+    out = out.drop(columns=list(dict.fromkeys(drop_cols)), errors="ignore")
+
+    preferred = [
+        "ticker",
+        "option_symbol",
+        "option_type",
+        "expiry_date",
+        "trade_date",
+        "strike",
+        "last_price",
+        "trades",
+        "volume",
+        "spot_ref",
+        "bsm_price",
+        "bsm_price_histvol",
+        "mispricing",
+        "mispricing_pct",
+        "iv",
+        "delta",
+        "gamma",
+        "vega",
+        "theta",
+        "rho",
+        "coberto",
+        "travado",
+        "descoberto",
+        "titulares",
+        "lancadores",
+        "notional_descoberto",
+        "hist_vol_annual_ref",
+        "model_collected_at",
+        "regime",
+    ]
+    cols = [col for col in preferred if col in out.columns] + [col for col in out.columns if col not in preferred]
+    out = out[cols]
+
+    rename_map = {
+        "ticker": "Ticker",
+        "option_symbol": "Opção",
+        "option_type": "Tipo",
+        "expiry_date": "Vencimento",
+        "trade_date": "Data",
+        "strike": "Strike",
+        "last_price": "Último",
+        "trades": "Negócios",
+        "volume": "Volume",
+        "spot_ref": "Spot Ref",
+        "bsm_price": "BSM",
+        "bsm_price_histvol": "BSM HistVol",
+        "mispricing": "Mispricing",
+        "mispricing_pct": "Mispricing %",
+        "iv": "IV",
+        "delta": "Delta",
+        "gamma": "Gamma",
+        "vega": "Vega",
+        "theta": "Theta",
+        "rho": "Rho",
+        "coberto": "Coberto",
+        "travado": "Travado",
+        "descoberto": "Descob.",
+        "titulares": "Tit.",
+        "lancadores": "Lanç.",
+        "notional_descoberto": "Notional Descob.",
+        "hist_vol_annual_ref": "Hist Vol Ref",
+        "model_collected_at": "Model Coletado Em",
+        "regime": "Regime",
+    }
+    return out.rename(columns=rename_map)
 
 
 def recommendation_score(strategy_key: str, table: pd.DataFrame, regime: str) -> float:
@@ -335,4 +452,4 @@ with tab_universe:
         st.warning("Sem dados para montar o universo.")
         st.stop()
     df2 = classify_moneyness_multi(df_raw.copy(), atm_mode="pct", atm_pct=0.01)
-    st.dataframe(format_table(df2), width="stretch", height=580, hide_index=True)
+    st.dataframe(format_table(optimize_universe_table(df2)), width="stretch", height=580, hide_index=True)
