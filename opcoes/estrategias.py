@@ -170,7 +170,7 @@ def _payoff(K, tp, q, px, acao, S0, ST) -> np.ndarray:
 
 
 COLS_CADEIA = ["simbolo", "tipo", "strike", "teorico", "ultimo", "fonte_preco", "preco_ref", "iv_modelo", "liquidez",
-               "delta", "theta", "vega"]
+               "delta", "gama", "theta", "vega"]
 
 
 def _avaliar(bl: Bloco, g: dict[str, np.ndarray], S0: float, du: int, r: float, amostras: np.ndarray) -> pd.DataFrame:
@@ -238,7 +238,7 @@ def _avaliar(bl: Bloco, g: dict[str, np.ndarray], S0: float, du: int, r: float, 
 
     liq = np.where(vazio, 9, col("liquidez", 9)).min(1)
     teorico = ((col("fonte_preco", "") == "teórico") & ~vazio).any(1)
-    gregas = {n: (q * col(n).astype(float)).sum(1) for n in ("delta", "theta", "vega")}
+    gregas = {n: (q * col(n).astype(float)).sum(1) for n in ("delta", "gama", "theta", "vega")}
     gregas["delta"] = gregas["delta"] + acao
 
     est = ESTRATEGIAS[bl.chave]
@@ -265,6 +265,8 @@ def _avaliar(bl: Bloco, g: dict[str, np.ndarray], S0: float, du: int, r: float, 
             "be2": be2,
             "pop": pop,
             "ev": ev,
+            "carrego": premio * (np.exp(r * T) - 1),  # rendimento (+) ou custo (−) do caixa até o vencimento, no CDI
+            "risco": dp,  # desvio-padrão do resultado (com piso), base do índice
             "cvar5": cvar,
             "vantagem": vantagem,
             "vantagem_pct": vantagem / capital,
@@ -272,6 +274,7 @@ def _avaliar(bl: Bloco, g: dict[str, np.ndarray], S0: float, du: int, r: float, 
             "indice": vantagem / dp * np.sqrt(DU_ANO / max(du, 1)),
             "retorno_max": np.where(np.isfinite(max_lucro), max_lucro / capital, np.inf),
             "delta": gregas["delta"],
+            "gama": gregas["gama"],
             "theta": gregas["theta"],
             "vega": gregas["vega"],
             "liquidez_min": liq,

@@ -3,14 +3,19 @@
 Painel local (Streamlit) para **encontrar estratégias com opções** nos ativos mais líquidos da B3 e
 **registrar e acompanhar operações** — reais ou de estudo — até o vencimento.
 
-```bash
-pip install -r requirements.txt
-python atualizar.py --universo   # 1ª vez: ranking de liquidez (~6 min) + cotações dos mais líquidos
-streamlit run app.py
+O ambiente é gerenciado pelo [uv](https://docs.astral.sh/uv/): `pyproject.toml` + `uv.lock` fixam as versões
+exatas e o uv usa um Python 3.13 próprio — independente do conda/miniconda (`base`, `myenv`).
+
+```powershell
+# instalar o uv (uma vez): powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+uv sync                                  # cria .venv com as versões travadas
+uv run atualizar.py --universo           # 1ª vez: ranking de liquidez + cotações dos mais líquidos
+uv run streamlit run app.py              # abre o painel
 ```
 
-No dia a dia: `python atualizar.py` (ou o botão **Atualizar cotações** no painel), de preferência após o
-fechamento; `python atualizar.py --operacoes` (botão **Só ativos com operações abertas**) é a versão rápida.
+No dia a dia: `uv run atualizar.py` (ou o botão **Atualizar cotações** no painel), de preferência após o
+fechamento; `uv run atualizar.py --operacoes` (botão **Só ativos com operações abertas**) é a versão rápida.
+Sem uv: `pip install -r requirements.txt` (exportado do `uv.lock`, mesmas versões).
 O opcoes.net.br limita requisições por IP: a coleta espera ~5 s entre chamadas e, se o site pedir uma
 espera longa, para, salva o que já coletou e avisa — basta rodar de novo mais tarde.
 
@@ -28,8 +33,10 @@ schtasks /Create /TN "Painel Opcoes" /SC WEEKLY /D MON,TUE,WED,THU,FRI /ST 18:30
 venda coberta, venda de put, travas de alta/baixa (crédito e débito), iron condor, collar, compra de
 call/put e straddle/strangle. Filtros por visão de mercado (alta, baixa, neutra, volatilidade), prazo,
 liquidez mínima por perna, probabilidade de lucro e perda máxima. Cada candidato mostra prêmio, capital,
-lucro/perda máximos, pontos de equilíbrio, probabilidade de lucro, CVaR 5%, gregas e o payoff
-(no vencimento e hoje). Um clique registra a operação como **ESTUDO** ou **REAL**.
+lucro/perda máximos, pontos de equilíbrio, probabilidade de lucro, CVaR 5%, gregas da posição e de cada
+perna (delta, gama, theta, vega) e o payoff (no vencimento e hoje). O quadro **Critérios do ranking**
+explica a ordenação e a aba **Por que esta posição** decompõe o índice e compara a linha escolhida com a
+de baixo. Um clique registra a operação como **ESTUDO** ou **REAL**.
 
 **📒 Operações** — para cada operação:
 - **Desfazer hoje**: caixa que entra/sai ao zerar tudo e o resultado final, com custos;
@@ -66,6 +73,7 @@ IV ATM × volatilidade histórica, tendência; escolha dos ativos acompanhados; 
 
 | Arquivo | Conteúdo |
 |---|---|
+| `pyproject.toml`, `uv.lock`, `.python-version` | dependências e versões exatas (uv) |
 | `app.py` | painel Streamlit |
 | `atualizar.py` | atualização pela linha de comando |
 | `opcoes/fontes.py` | coleta (opcoes.net.br, Yahoo, BCB) com respeito ao limite de requisições do site |

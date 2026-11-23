@@ -20,3 +20,6 @@ data/volatilidade_hist.parquet
 data/meta.json
 data/*.tmp
 data/vencimentos.json
+
+# ambiente virtual do uv
+.venv/

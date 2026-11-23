@@ -1,0 +1,20 @@
+[project]
+name = "painel-opcoes"
+version = "1.0.0"
+description = "Painel local de estratégias e acompanhamento de operações com opções da B3"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "streamlit>=1.62,<2",
+    "pandas>=3.0,<4",
+    "numpy>=2.2,<3",
+    "scipy>=1.14,<2",
+    "pyarrow>=18",
+    "requests>=2.32,<3",
+    "yfinance>=1.0,<2",
+    "lxml>=5",
+]
+
+[tool.uv]
+package = false # aplicação (app.py + pacote opcoes/), não uma biblioteca publicável
+python-preference = "only-managed" # Python próprio do uv: independente do conda/miniconda instalado

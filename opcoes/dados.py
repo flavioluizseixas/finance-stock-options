@@ -543,7 +543,9 @@ def atualizar_mercado(
         erros=erros,
     )
     _p(progresso, 1.0, "Concluído")
-    return {"ativos": ativos, "linhas": len(hoje), "sessao": pd.Timestamp(sessao).date(), "erros": erros}
+    coletados = set(bruto["ativo"])
+    return {"ativos": sorted(coletados), "linhas": int(hoje["ativo"].isin(coletados).sum()),
+            "sessao": pd.Timestamp(sessao).date(), "erros": erros}
 
 
 def _limpar_arquivo_antigo() -> None:

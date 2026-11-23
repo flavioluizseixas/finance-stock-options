@@ -238,9 +238,10 @@ def avaliar_pernas(pernas: pd.DataFrame, cadeia: pd.DataFrame, precos: pd.DataFr
     linhas = []
     for row in p.itertuples(index=False):
         info = {"preco_atual": np.nan, "fonte": "", "strike_atual": row.strike, "iv": np.nan, "delta": np.nan,
-                "theta": np.nan, "du": 0, "liquidez": np.nan, "ativo_obj": None, "spot": np.nan, "ultimo_negocio": pd.NaT}
+                "gama": np.nan, "theta": np.nan, "vega": np.nan, "du": 0, "liquidez": np.nan, "ativo_obj": None,
+                "spot": np.nan, "ultimo_negocio": pd.NaT}
         if row.tipo == "ACAO":
-            info.update(ativo_obj=row.simbolo, spot=spot_de(row.simbolo), delta=1.0, theta=0.0)
+            info.update(ativo_obj=row.simbolo, spot=spot_de(row.simbolo), delta=1.0, gama=0.0, theta=0.0, vega=0.0)
             info.update(preco_atual=info["spot"], fonte="ação")
         elif not cad.empty and row.simbolo in cad.index:
             c = cad.loc[row.simbolo]
@@ -248,7 +249,8 @@ def avaliar_pernas(pernas: pd.DataFrame, cadeia: pd.DataFrame, precos: pd.DataFr
                 c = c.iloc[0]
             info.update(
                 preco_atual=float(c["preco_ref"]), fonte=str(c["fonte_preco"]), strike_atual=float(c["strike"]),
-                iv=float(c["iv_modelo"]), delta=float(c["delta"]), theta=float(c["theta"]), du=int(c["du"]),
+                iv=float(c["iv_modelo"]), delta=float(c["delta"]), gama=float(c["gama"]), theta=float(c["theta"]),
+                vega=float(c["vega"]), du=int(c["du"]),
                 liquidez=int(c["liquidez"]), ativo_obj=c["ativo"], spot=float(c["spot"]), ultimo_negocio=c["data_ultimo"],
             )
         else:  # série fora da cadeia (vencida ou ativo não acompanhado)
@@ -288,8 +290,8 @@ def avaliar_pernas(pernas: pd.DataFrame, cadeia: pd.DataFrame, precos: pd.DataFr
         aberta, config.CUSTO_PCT / 100 * (q * out["preco_atual"]).abs() + config.CORRETAGEM_ORDEM, 0.0
     )
     out["strike_ajustado"] = (out["tipo"] != "ACAO") & (np.abs(out["strike_atual"] - out["strike"]) > 0.005)
-    out["delta_pos"] = sinal * q * out["delta"]
-    out["theta_pos"] = sinal * q * out["theta"]
+    for g in ("delta", "gama", "theta", "vega"):  # gregas da posição (lado × quantidade), só pernas abertas
+        out[f"{g}_pos"] = np.where(aberta, sinal * q * out[g], 0.0)
     out["taxa_r"] = r
     return out
 
@@ -367,7 +369,9 @@ def resumo(op: pd.Series, av: pd.DataFrame, S_venc: float | None = None) -> dict
         "vencimento": venc.min() if not venc.empty else pd.NaT,
         "du": int(abertas.loc[abertas["tipo"] != "ACAO", "du"].min()) if (abertas["tipo"] != "ACAO").any() else 0,
         "delta": float(abertas["delta_pos"].sum()),
+        "gama": float(abertas["gama_pos"].sum()),
         "theta": float(abertas["theta_pos"].sum()),
+        "vega": float(abertas["vega_pos"].sum()),
         "base_capital": base,
         "teorico": bool(((abertas["tipo"] != "ACAO") & (abertas["fonte"] != "último")).any()),
     }

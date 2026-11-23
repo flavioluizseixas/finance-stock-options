@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import date
 from pathlib import Path
 
@@ -29,6 +30,17 @@ CRITERIOS = {
 # ---------------------------------------------------------------------------
 # Utilidades
 # ---------------------------------------------------------------------------
+
+def chave_tabela(nome: str, filtros: tuple) -> str:
+    """Chave do widget que muda com os filtros: ao filtrar, a seleção anterior é descartada."""
+    return f"{nome}_{hashlib.md5(repr(filtros).encode()).hexdigest()[:10]}"
+
+
+def linha_selecionada(ev, n_linhas: int) -> int | None:
+    """Linha escolhida numa tabela com seleção, ignorando seleção que não existe mais na tabela atual."""
+    linhas = ev.selection.rows if ev is not None else []
+    return linhas[0] if linhas and 0 <= linhas[0] < n_linhas else None
+
 
 @st.cache_data(show_spinner=False)
 def _ler(caminho: str, versao: float) -> pd.DataFrame:
@@ -156,9 +168,110 @@ def form_registro(pernas: list[dict], ativo: str, estrategia: str, spot: float, 
             st.success(f"Operação #{op_id} registrada como {modo}. Acompanhe na aba **Operações**.")
 
 
-def detalhe_candidato(row: pd.Series) -> None:
+def _comparativo(row: pd.Series, abaixo: pd.Series | None, posicao: int, criterio: str) -> None:
+    """Explica a posição no ranking: decomposição do índice e comparação com a linha de baixo."""
+    k = lote
+    col = CRITERIOS[criterio]
+    st.markdown(f"**Posição {posicao} na lista, ordenada por “{criterio}”.**")
+    st.markdown(
+        "| Composição do índice (por lote) | Valor |\n|---|---:|\n"
+        f"| Valor esperado no vencimento (cenários históricos, já descontados custos de {brl(row['custo'] * k)}) | "
+        f"{brl(row['ev'] * k, True)} |\n"
+        f"| {'+ rendimento do prêmio recebido' if row['carrego'] >= 0 else '− custo do capital aplicado'} até o vencimento (CDI) | "
+        f"{brl(row['carrego'] * k, True)} |\n"
+        f"| **= Vantagem esperada acima do CDI** | **{brl(row['vantagem'] * k, True)}** |\n"
+        f"| ÷ Risco: desvio-padrão do resultado nos cenários (piso de 5% a.a. do capital) | {brl(row['risco'] * k)} |\n"
+        f"| × √(252 ÷ {int(row['du'])} pregões) — anualização | {num(np.sqrt(252 / max(row['du'], 1)), 2)} |\n"
+        f"| **= Vantagem ÷ risco (anualizado)** | **{num(row['indice'], 2)}** |"
+    )
+    if abaixo is None:
+        st.caption("É a última linha exibida — não há linha abaixo para comparar.")
+        return
+
+    def linha(nome, campo, fmt, mult=1.0, maior_melhor=True):
+        a, b = row[campo] * mult, abaixo[campo] * mult
+        melhor = "—"
+        if np.isfinite(a) and np.isfinite(b) and abs(a - b) > 1e-12:
+            melhor = "esta" if (a > b) == maior_melhor else "a de baixo"
+        return {"Métrica": nome, f"Esta (#{posicao})": fmt(a), f"Linha de baixo (#{posicao + 1})": fmt(b),
+                "Melhor": melhor, "_campo": campo}
+
+    tabela = [
+        linha("Vantagem ÷ risco (anualizado)", "indice", lambda v: num(v, 2)),
+        linha("Vantagem esperada acima do CDI (R$)", "vantagem", lambda v: brl(v, True), k),
+        linha("Vantagem em % do capital", "vantagem_pct", lambda v: pct(v, 1, True)),
+        linha("Vantagem anualizada", "vantagem_aa", lambda v: pct(v, 0, True)),
+        linha("Risco — desvio do resultado (R$)", "risco", brl, k, maior_melhor=False),
+        linha("Probabilidade de lucro", "pop", lambda v: pct(v, 0)),
+        linha("CVaR 5% — média dos piores cenários (R$)", "cvar5", brl, k),
+        linha("Retorno máximo sobre o capital", "retorno_max", lambda v: pct(v, 0) if np.isfinite(v) else "ilimitado"),
+        linha("Capital/risco alocado (R$)", "capital", brl, k, maior_melhor=False),
+        linha("Perda máxima (R$)", "max_perda", brl, k),
+        linha("Liquidez mínima das pernas", "liquidez_min", lambda v: LIQ.get(int(v), "—")),
+        linha("Pregões até o vencimento", "du", lambda v: f"{int(v)}", maior_melhor=False),
+    ]
+    comp = pd.DataFrame(tabela)
+    sel = comp[comp["_campo"] == col].iloc[0]
+    nome_b = f"{abaixo['estrategia']} · {abaixo['ativo']} · {pd.Timestamp(abaixo['vencimento']):%d/%m}"
+    st.markdown(
+        f"**Por que está acima de #{posicao + 1}** ({nome_b} — {abaixo['descricao_pernas']}): o critério de ordenação "
+        f"“{criterio}” vale **{sel[f'Esta (#{posicao})']}** contra **{sel[f'Linha de baixo (#{posicao + 1})']}**. "
+        "As demais métricas ajudam a decidir se a diferença compensa (ex.: mais vantagem com mais risco)."
+    )
+    destaque = comp["_campo"] == col
+    st.dataframe(
+        comp.drop(columns="_campo").style.apply(
+            lambda r: ["font-weight: bold" if destaque.iloc[r.name] else "" for _ in r], axis=1),
+        hide_index=True, width="stretch",
+    )
+    st.caption(f"A lista mostra no máximo {int(st.session_state.get('por_grupo', 3))} estruturas por ativo e estratégia; "
+               "por isso a linha de baixo pode ser de outro ativo ou estratégia.")
+
+
+def _gregas_pernas(row: pd.Series, k: int) -> None:
+    """Gregas da posição (por lote) e de cada perna."""
+    g = st.columns(4)
+    g[0].metric("Delta", f"{num(row['delta'] * k, 0)} ações",
+                help="Variação do resultado para R$ 1 de alta no ativo, em ações equivalentes.")
+    g[1].metric("Gama", num(row['gama'] * k, 1), help="Quanto o delta muda para R$ 1 de alta no ativo.")
+    g[2].metric("Theta", f"{brl(row['theta'] * k, True)}/dia", help="Efeito da passagem de um pregão, tudo o mais constante.")
+    g[3].metric("Vega", brl(row['vega'] * k, True), help="Efeito de +1 ponto percentual na volatilidade implícita.")
+    cad = cadeia.set_index("simbolo")
+    linhas = []
+    if row.get("acao_qtd", 0):
+        linhas.append({"Lado": "COMPRA", "Série": row["ativo"], "Tipo": "AÇÃO", "Strike": np.nan, "Qtd": int(k * row["acao_qtd"]),
+                       "Preço justo": row["spot"], "Último": row["spot"], "IV": np.nan, "Delta": 1.0, "Gama": 0.0,
+                       "Theta/dia": 0.0, "Vega": 0.0, "Liquidez": "—"})
+    for j in range(4):
+        s = row.get(f"s{j}")
+        if not s:
+            continue
+        c = cad.loc[s] if s in cad.index else None
+        if isinstance(c, pd.DataFrame):
+            c = c.iloc[0]
+        linhas.append({
+            "Lado": "COMPRA" if row[f"q{j}"] > 0 else "VENDA", "Série": s, "Tipo": row[f"t{j}"], "Strike": row[f"k{j}"],
+            "Qtd": int(round(abs(row[f"q{j}"]) * k)), "Preço justo": row[f"p{j}"],
+            "Último": c["ultimo"] if c is not None and c["fonte_preco"] == "último" else np.nan,
+            "IV": row[f"iv{j}"], "Delta": c["delta"] if c is not None else np.nan, "Gama": c["gama"] if c is not None else np.nan,
+            "Theta/dia": c["theta"] if c is not None else np.nan, "Vega": c["vega"] if c is not None else np.nan,
+            "Liquidez": LIQ.get(int(c["liquidez"]), "—") if c is not None else "—",
+        })
+    st.dataframe(pd.DataFrame(linhas), hide_index=True, width="stretch", column_config={
+        "Strike": st.column_config.NumberColumn(format="%.2f"), "Preço justo": st.column_config.NumberColumn(format="%.2f"),
+        "Último": st.column_config.NumberColumn(format="%.2f", help="Último negócio do pregão (vazio se não negociou)"),
+        "IV": st.column_config.NumberColumn(format="percent"), "Delta": st.column_config.NumberColumn(format="%.3f"),
+        "Gama": st.column_config.NumberColumn(format="%.3f"), "Theta/dia": st.column_config.NumberColumn(format="%.4f"),
+        "Vega": st.column_config.NumberColumn(format="%.4f"),
+    })
+    st.caption("Gregas por pernas são por opção (1 unidade), com a IV do smile; os totais acima já consideram lado e quantidade.")
+
+
+def detalhe_candidato(row: pd.Series, abaixo: pd.Series | None = None, posicao: int = 1,
+                      criterio: str = "Vantagem ÷ risco (recomendado)") -> None:
     est = estrategias.ESTRATEGIAS[row["chave"]]
-    st.subheader(f"{est.nome} · {row['ativo']} · vence {pd.Timestamp(row['vencimento']):%d/%m/%Y} ({int(row['du'])} pregões)")
+    st.subheader(f"#{posicao} · {est.nome} · {row['ativo']} · vence {pd.Timestamp(row['vencimento']):%d/%m/%Y} "
+                 f"({int(row['du'])} pregões)")
     st.caption(est.descricao)
     k = lote
     c = st.columns(6)
@@ -172,8 +285,7 @@ def detalhe_candidato(row: pd.Series) -> None:
                 help="Valor esperado acima do CDI até o vencimento, na distribuição histórica do ativo escalada pela "
                      f"vol atual ({pct(row['vantagem_aa'], 0, True)} se anualizado).")
     st.caption(
-        f"CVaR 5% (média dos 5% piores cenários): {brl(row['cvar5'] * k)} · Δ {num(row['delta'] * k, 0)} ações · "
-        f"Θ {brl(row['theta'] * k, True)}/dia · "
+        f"CVaR 5% (média dos 5% piores cenários): {brl(row['cvar5'] * k)} · "
         f"equilíbrio: {', '.join(num(x) for x in (row['be1'], row['be2']) if np.isfinite(x)) or '—'}"
     )
     vm, iv = row.get("vol_modelo", np.nan), row["iv_atm"]
@@ -194,7 +306,13 @@ def detalhe_candidato(row: pd.Series) -> None:
     av_justo = pernas_df_para_avaliacao(estrategias.pernas_da_linha(row, k, preco="justo"), int(row["du"]), r)
     venc = operacoes.resultado_vencimento(av_justo, S) - row["custo"] * k
     hoje = operacoes.resultado_hoje_curva(av_justo, S) - row["custo"] * k
-    st.altair_chart(graficos.payoff(S, venc, hoje, S0, breakevens=[row["be1"], row["be2"]]), width="stretch")
+    t_pay, t_porque, t_greg = st.tabs(["📈 Payoff", "⚖️ Por que esta posição", "Δ Gregas e pernas"])
+    with t_pay:
+        st.altair_chart(graficos.payoff(S, venc, hoje, S0, breakevens=[row["be1"], row["be2"]]), width="stretch")
+    with t_porque:
+        _comparativo(row, abaixo, posicao, criterio)
+    with t_greg:
+        _gregas_pernas(row, k)
     form_registro(pernas, row["ativo"], est.nome, S0, f"{row.name}")
 
 
@@ -217,7 +335,7 @@ with aba_est:
                                 format_func=lambda c: estrategias.ESTRATEGIAS[c].nome)
         pop_min = g2.slider("Prob. de lucro mínima", 0, 95, 0, step=5, format="%d%%") / 100
         criterio = g3.selectbox("Ordenar por", list(CRITERIOS))
-        por_grupo = g4.number_input("Máx. por ativo/estratégia", 1, 50, 3)
+        por_grupo = g4.number_input("Máx. por ativo/estratégia", 1, 50, 3, key="por_grupo")
         perda_lim = st.number_input("Perda máxima aceitável por lote (R$, 0 = sem limite)", min_value=0.0, step=100.0, value=0.0)
 
         if not ativos_sel or not chaves:
@@ -234,13 +352,39 @@ with aba_est:
                 col = CRITERIOS[criterio]
                 f = f.assign(_o=f[col].replace(np.inf, np.nan)).sort_values("_o", ascending=False)
                 f = f.groupby(["ativo", "chave"]).head(int(por_grupo)).head(150)
-                st.caption(
-                    f"{len(res):,} estruturas avaliadas · {len(f)} exibidas. Preços pelo **smile ajustado aos negócios do dia** "
-                    "(o último negócio de cada série ocorre em horários diferentes). Vantagem = valor esperado acima do CDI "
-                    "na distribuição histórica do ativo, já descontados custos e meio spread."
-                )
+                st.caption(f"{len(res):,} estruturas avaliadas · {len(f)} exibidas, ordenadas por **{criterio}**.")
+                with st.expander("📐 Critérios do ranking — como uma linha fica acima da outra"):
+                    st.markdown(
+                        f"""
+**Ordem da lista:** decrescente por **{criterio}**. Selecione uma linha e abra *⚖️ Por que esta posição* para ver a
+comparação com a linha de baixo.
+
+**Filtros antes de ordenar** (a estrutura é descartada se falhar em algum):
+- todas as pernas com liquidez **{liq_txt}** ou melhor e prêmio justo ≥ {brl(config.PREMIO_MIN)};
+- vencimento entre {du_min} e {du_max} pregões; visão de mercado “{visao}”;
+- probabilidade de lucro ≥ {pct(pop_min, 0)}{f"; perda máxima ≤ {brl(perda_lim)} por lote" if perda_lim > 0 else ""};
+- no máximo {int(por_grupo)} estruturas por ativo e estratégia (diversifica a lista).
+
+**Como cada número é calculado** (por unidade; a tabela multiplica pelo lote de {lote}):
+- **Preço**: preço justo do *smile* ajustado aos negócios do dia — o último negócio de cada série acontece em
+  horários diferentes e, combinado entre pernas, cria arbitragens falsas.
+- **Cenários**: 800 preços possíveis no vencimento, a partir dos choques diários do próprio ativo desde 2018,
+  escalados pela volatilidade atual (mantém caudas gordas e assimetria) e com média no forward (CDI).
+- **Vantagem esperada** = resultado médio nos cenários (já com emolumentos, corretagem e meio spread de
+  {brl(config.CUSTO_TICK)} por opção) + rendimento do prêmio recebido no CDI (ou − custo do capital aplicado).
+  Positiva = o prêmio de mercado paga mais do que o risco realista da estrutura.
+- **Risco** = desvio-padrão do resultado nos cenários (piso de 5% a.a. do capital, para vendas muito fora do dinheiro).
+- **Vantagem ÷ risco** = vantagem ÷ risco × √(252 ÷ pregões) — compara prazos diferentes; é o critério recomendado
+  porque não favorece estruturas de capital minúsculo nem prêmios "moedinha".
+- **Prob. de lucro**, **CVaR 5%** (média dos 5% piores cenários), **lucro/perda máximos** e **equilíbrio**: exatos
+  no vencimento, pelo payoff de cada perna.
+- **Gregas** (posição por lote): Delta em ações equivalentes; Gama = variação do delta por R$ 1 no ativo;
+  Theta = R$ por pregão; Vega = R$ por +1 ponto de volatilidade implícita.
+"""
+                    )
                 tab = pd.DataFrame(
                     {
+                        "#": np.arange(1, len(f) + 1),
                         "Ativo": f["ativo"],
                         "Estratégia": f["estrategia"],
                         "Pernas": f["descricao_pernas"],
@@ -254,12 +398,17 @@ with aba_est:
                         "Vantagem": f["vantagem_pct"],
                         "Vantagem÷risco": f["indice"],
                         "Delta (ações)": f["delta"] * lote,
+                        "Gama": f["gama"] * lote,
+                        "Theta/dia": f["theta"] * lote,
+                        "Vega": f["vega"] * lote,
                         "Liquidez": f["liquidez_min"].map(LIQ),
                     }
                 )
+                filtros = (tuple(ativos_sel), visao, du_min, du_max, liq_min, tuple(sorted(chaves)), pop_min, criterio,
+                           int(por_grupo), perda_lim)
                 ev = st.dataframe(
                     tab, hide_index=True, width="stretch", height=420, on_select="rerun", selection_mode="single-row",
-                    key="tab_estrategias",
+                    key=chave_tabela("tab_estrategias", filtros),
                     column_config={
                         "Pernas": st.column_config.TextColumn(width="large"),
                         "Vencimento": st.column_config.DateColumn(format="DD/MM/YY"),
@@ -272,11 +421,16 @@ with aba_est:
                             format="percent", help="Valor esperado acima do CDI até o vencimento, em % do capital"),
                         "Vantagem÷risco": st.column_config.NumberColumn(format="%.2f",
                                                                         help="Vantagem esperada ÷ desvio-padrão do resultado, anualizado"),
-                        "Delta (ações)": st.column_config.NumberColumn(format="%.0f"),
+                        "Delta (ações)": st.column_config.NumberColumn(format="%.0f", help="Ações equivalentes da posição"),
+                        "Gama": st.column_config.NumberColumn(format="%.1f", help="Variação do delta por R$ 1 no ativo"),
+                        "Theta/dia": st.column_config.NumberColumn(format="localized", help="R$ por pregão (positivo = ganha com o tempo)"),
+                        "Vega": st.column_config.NumberColumn(format="localized", help="R$ por +1 ponto de volatilidade implícita"),
+                        "#": st.column_config.NumberColumn(width="small"),
                     },
                 )
-                if ev.selection.rows:
-                    detalhe_candidato(f.iloc[ev.selection.rows[0]])
+                i = linha_selecionada(ev, len(f))
+                if i is not None:
+                    detalhe_candidato(f.iloc[i], f.iloc[i + 1] if i + 1 < len(f) else None, i + 1, criterio)
                 else:
                     st.info("Selecione uma linha para ver o payoff e registrar a operação (estudo ou real).")
 
@@ -372,7 +526,13 @@ def detalhe_operacao(op: pd.Series, av: pd.DataFrame, rs: dict) -> None:
                     pct(rs["resultado_venc"] / rs["base_capital"], 1, True))
         c[3].metric("Pregões até o vencimento", f"{rs['du']}" if rs["du"] else "—",
                     f"{pd.Timestamp(rs['vencimento']):%d/%m/%Y}" if pd.notna(rs["vencimento"]) else None, delta_color="off")
-        c[4].metric("Delta · Theta/dia", f"{num(rs['delta'], 0)} · {brl(rs['theta'], True)}")
+        c[4].metric("Ativo-objeto agora", brl(spot))
+        g = st.columns(4)
+        g[0].metric("Delta da posição", f"{num(rs['delta'], 0)} ações",
+                    help="Variação do resultado para R$ 1 de alta no ativo, em ações equivalentes.")
+        g[1].metric("Gama", num(rs["gama"], 1), help="Quanto o delta muda para R$ 1 de alta no ativo.")
+        g[2].metric("Theta", f"{brl(rs['theta'], True)}/dia", help="Efeito da passagem de um pregão, tudo o mais constante.")
+        g[3].metric("Vega", brl(rs["vega"], True), help="Efeito de +1 ponto percentual na volatilidade implícita.")
     else:
         c[2].metric("Resultado realizado", brl(rs["realizado"] - rs["custos"] + rs["proventos"], True))
     if rs["teorico"]:
@@ -386,6 +546,7 @@ def detalhe_operacao(op: pd.Series, av: pd.DataFrame, rs: dict) -> None:
             "Entrada": av["preco_entrada"], "Atual/saída": np.where(av["aberta"], av["preco_atual"], av["preco_saida"]),
             "Fonte": np.where(av["aberta"], av["fonte"], "encerrada " + pd.to_datetime(av["data_saida"]).dt.strftime("%d/%m/%y")),
             "Resultado": av["resultado"], "Caixa p/ desfazer": av["caixa_desfazer"],
+            "IV": av["iv"], "Delta": av["delta_pos"], "Gama": av["gama_pos"], "Theta/dia": av["theta_pos"], "Vega": av["vega_pos"],
             "Liquidez": av["liquidez"].map(lambda x: LIQ.get(int(x), "—") if pd.notna(x) else "—"),
         }
     )
@@ -396,6 +557,11 @@ def detalhe_operacao(op: pd.Series, av: pd.DataFrame, rs: dict) -> None:
         "Entrada": st.column_config.NumberColumn(format="%.2f"), "Atual/saída": st.column_config.NumberColumn(format="%.2f"),
         "Resultado": st.column_config.NumberColumn(format="localized"),
         "Caixa p/ desfazer": st.column_config.NumberColumn(format="localized"),
+        "IV": st.column_config.NumberColumn(format="percent", help="Volatilidade implícita atual da série (smile)"),
+        "Delta": st.column_config.NumberColumn(format="%.0f", help="Delta da perna × lado × quantidade (ações equivalentes)"),
+        "Gama": st.column_config.NumberColumn(format="%.1f"),
+        "Theta/dia": st.column_config.NumberColumn(format="localized", help="R$ por pregão desta perna"),
+        "Vega": st.column_config.NumberColumn(format="localized", help="R$ por +1 ponto de vol. implícita desta perna"),
     })
     if av["strike_ajustado"].any():
         st.caption("ℹ️ Strike ajustado por proventos desde a entrada — informe os proventos recebidos das ações em **Gerenciar** "
@@ -580,8 +746,11 @@ with aba_ops:
             vis = vis[vis["Tipo"] == modo_f]
         if status_f and status_f != "Todas":
             vis = vis[vis["Status"] == status_f]
+        if vis.empty:
+            st.caption("Nenhuma operação com esse filtro.")
         ev = st.dataframe(
-            vis, hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row", key="tab_ops",
+            vis, hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row",
+            key=chave_tabela("tab_ops", (modo_f, status_f, len(resumo_df))),
             column_config={
                 "op_id": st.column_config.NumberColumn("#", format="%d"),
                 "Entrada": st.column_config.DateColumn(format="DD/MM/YY"),
@@ -592,8 +761,9 @@ with aba_ops:
                 "Caixa p/ desfazer": st.column_config.NumberColumn(format="localized"),
             },
         )
-        if ev.selection.rows:
-            op_id = int(vis.iloc[ev.selection.rows[0]]["op_id"])
+        i = linha_selecionada(ev, len(vis))
+        if i is not None:
+            op_id = int(vis.iloc[i]["op_id"])
             op = ops[ops["op_id"] == op_id].iloc[0]
             detalhe_operacao(op, av_all[av_all["op_id"] == op_id].reset_index(drop=True), resumos[op_id])
         else:
