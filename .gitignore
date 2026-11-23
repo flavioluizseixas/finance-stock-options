@@ -9,3 +9,14 @@
 # seus diretórios
 backup/
 cache_yf/
+
+# dados de mercado (regeneráveis com `python atualizar.py`)
+# operacoes.parquet, pernas.parquet, historico_pernas.parquet e ativos_acompanhados.json continuam versionados
+data/cadeias/
+data/cadeia_atual.parquet
+data/precos_ativos.parquet
+data/universo.parquet
+data/volatilidade_hist.parquet
+data/meta.json
+data/*.tmp
+data/vencimentos.json
